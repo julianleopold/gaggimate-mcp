@@ -785,6 +785,10 @@ def compute_shot_diagnostics(shot: ShotData) -> Optional[ShotDiagnostics]:
         if f > 0.1:  # Skip near-zero flow to avoid division artifacts
             resistance_values.append(p / (f * f))
 
+    # Stalled shot detection: when all flows are ≤ 0.1 ml/s, the puck is
+    # choked and resistance is effectively infinite — not zero.
+    stalled_shot = len(resistance_values) == 0 and len(brew_flows) > 0
+
     r_avg = _round2(_safe_mean(resistance_values))
     r_std = _round2(_safe_std(resistance_values))
     r_slope = _round2(_linear_slope(resistance_values, dt))
@@ -800,20 +804,35 @@ def compute_shot_diagnostics(shot: ShotData) -> Optional[ShotDiagnostics]:
         if resistance_values else 0.0
     )
 
-    resistance = ResistanceDiagnostics(
-        avg=r_avg,
-        std=r_std,
-        slope=r_slope,
-        peak=r_peak,
-        peak_timing_pct=r_peak_timing,
-        annotations={
+    if stalled_shot:
+        resistance_annotations: dict[str, str] = {
+            "level": "STALLED",
+            "stability": "NO_DATA",
+            "erosion": "NO_DATA",
+            "saturation": "NO_DATA",
+            "stalled_shot": "true",
+            "note": "All flow readings ≤ 0.1 ml/s — puck is choked. "
+                    "Resistance is effectively infinite, not zero. "
+                    "Likely causes: grind far too fine, excessive dose, "
+                    "or severe puck compression.",
+        }
+    else:
+        resistance_annotations = {
             "level": _annotate_ascending(r_avg, _RESISTANCE_LEVEL_BANDS),
             "stability": _annotate_ascending(r_std, _RESISTANCE_STABILITY_BANDS),
             "erosion": _annotate_descending(r_slope, _RESISTANCE_SLOPE_BANDS),
             "saturation": _annotate_ascending(
                 r_peak_timing, _RESISTANCE_PEAK_TIMING_BANDS
             ),
-        },
+        }
+
+    resistance = ResistanceDiagnostics(
+        avg=r_avg,
+        std=r_std,
+        slope=r_slope,
+        peak=r_peak,
+        peak_timing_pct=r_peak_timing,
+        annotations=resistance_annotations,
     )
 
     # ── CHANNELING INDICATORS ────────────────────────────────
@@ -900,6 +919,12 @@ def compute_shot_diagnostics(shot: ShotData) -> Optional[ShotDiagnostics]:
     )
 
     # ── TEMPERATURE DIAGNOSTICS ──────────────────────────────
+    # Filter to samples where target temp is recorded (tt > 0) so that
+    # stability, overshoot and undershoot are computed on the same
+    # population — avoids incoherent comparisons for LLM consumers.
+    brew_temps_with_target = [
+        ct for ct, tt in zip(brew_temps, brew_target_temps) if tt > 0
+    ]
     temp_deviations = [
         ct - tt
         for ct, tt in zip(brew_temps, brew_target_temps)
@@ -907,7 +932,7 @@ def compute_shot_diagnostics(shot: ShotData) -> Optional[ShotDiagnostics]:
     ]
     t_overshoot = max(temp_deviations) if temp_deviations else 0.0
     t_undershoot = abs(min(temp_deviations)) if temp_deviations else 0.0
-    t_std = _round2(_safe_std(brew_temps))
+    t_std = _round2(_safe_std(brew_temps_with_target))
 
     temperature = TemperatureDiagnostics(
         overshoot_c=_round2(max(0.0, t_overshoot)),
@@ -1205,6 +1230,7 @@ def compute_summary_diagnostics(shot: ShotData) -> Optional[SummaryDiagnostics]:
 
     # Resistance
     r_values = [p / (f * f) for p, f in zip(brew_pressures, brew_flows) if f > 0.1]
+    stalled_shot = len(r_values) == 0 and len(brew_flows) > 0
     r_avg = _round2(_safe_mean(r_values))
     r_slope = _round2(_linear_slope(r_values, dt))
 
@@ -1228,8 +1254,13 @@ def compute_summary_diagnostics(shot: ShotData) -> Optional[SummaryDiagnostics]:
         f_vol = _safe_std(brew_flows)
         risk = "INSUFFICIENT_DATA"
 
-    # Temperature
-    t_std = _round2(_safe_std(brew_temps))
+    # Temperature — filter to samples with target temp (tt > 0) for
+    # consistency with overshoot/undershoot in detailed diagnostics.
+    brew_target_temps = [s.get('tt', 0.0) for s in brew_samples]
+    brew_temps_with_target = [
+        ct for ct, tt in zip(brew_temps, brew_target_temps) if tt > 0
+    ]
+    t_std = _round2(_safe_std(brew_temps_with_target if brew_temps_with_target else brew_temps))
 
     # Profile compliance
     p_rmse = 0.0
@@ -1257,8 +1288,8 @@ def compute_summary_diagnostics(shot: ShotData) -> Optional[SummaryDiagnostics]:
     has_scale = any(w > 0 for w in brew_weights)
 
     annotations: dict[str, str] = {
-        "resistance_level": _annotate_ascending(r_avg, _RESISTANCE_LEVEL_BANDS),
-        "resistance_erosion": _annotate_descending(r_slope, _RESISTANCE_SLOPE_BANDS),
+        "resistance_level": "STALLED" if stalled_shot else _annotate_ascending(r_avg, _RESISTANCE_LEVEL_BANDS),
+        "resistance_erosion": "NO_DATA" if stalled_shot else _annotate_descending(r_slope, _RESISTANCE_SLOPE_BANDS),
         "channeling_risk": risk,
         "temperature_stability": _annotate_ascending(t_std, _TEMP_STABILITY_BANDS),
         "pressure_adherence": _annotate_ascending(p_rmse, _PROFILE_ADHERENCE_BANDS),
@@ -1274,6 +1305,8 @@ def compute_summary_diagnostics(shot: ShotData) -> Optional[SummaryDiagnostics]:
         annotations["flow_overshoot"] = _annotate_ascending(
             max_flow_overshoot, _FLOW_DEVIATION_BANDS
         )
+    if stalled_shot:
+        annotations["stalled_shot"] = "true"
 
     return SummaryDiagnostics(
         resistance_avg=r_avg,

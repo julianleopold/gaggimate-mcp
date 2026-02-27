@@ -509,10 +509,12 @@ async def manage_profile(
             "suggestion": _get_error_suggestion(e)
         })
     except Exception as e:
-        logger.error("manage_profile_unexpected_error", action=action, error=str(e))
+        error_msg = str(e) or f"{type(e).__name__} (no message)"
+        logger.error("manage_profile_unexpected_error", action=action, error=error_msg, exception_type=type(e).__name__)
         return json.dumps({
             "success": False,
-            "error": f"Unexpected error: {str(e)}"
+            "error": f"Unexpected error: {error_msg}",
+            "exception_type": type(e).__name__
         })
 
 
@@ -739,10 +741,12 @@ async def manage_shot_notes(
             "error": f"Value error: {str(e)}"
         })
     except Exception as e:
-        logger.error("manage_shot_notes_unexpected_error", shot_id=shot_id, error=str(e))
+        error_msg = str(e) or f"{type(e).__name__} (no message)"
+        logger.error("manage_shot_notes_unexpected_error", shot_id=shot_id, error=error_msg, exception_type=type(e).__name__)
         return json.dumps({
             "success": False,
-            "error": f"Unexpected error: {str(e)}"
+            "error": f"Unexpected error: {error_msg}",
+            "exception_type": type(e).__name__
         })
 
 
@@ -830,10 +834,12 @@ async def list_recent_shots(limit: int = 10) -> str:
             "suggestion": _get_error_suggestion(e)
         })
     except Exception as e:
-        logger.error("list_recent_shots_unexpected_error", limit=limit, error=str(e))
+        error_msg = str(e) or f"{type(e).__name__} (no message)"
+        logger.error("list_recent_shots_unexpected_error", limit=limit, error=error_msg, exception_type=type(e).__name__)
         return json.dumps({
             "success": False,
-            "error": f"Unexpected error: {str(e)}"
+            "error": f"Unexpected error: {error_msg}",
+            "exception_type": type(e).__name__
         })
 
 
@@ -1091,10 +1097,12 @@ async def manage_coffee(
             })
 
     except Exception as e:
-        logger.error("manage_coffee_error", action=action, error=str(e))
+        error_msg = str(e) or f"{type(e).__name__} (no message)"
+        logger.error("manage_coffee_error", action=action, error=error_msg, exception_type=type(e).__name__)
         return json.dumps({
             "success": False,
-            "error": f"Unexpected error: {str(e)}"
+            "error": f"Unexpected error: {error_msg}",
+            "exception_type": type(e).__name__
         })
 
 
@@ -1164,10 +1172,12 @@ async def manage_user_setup(
             })
 
     except Exception as e:
-        logger.error("manage_user_setup_error", action=action, error=str(e))
+        error_msg = str(e) or f"{type(e).__name__} (no message)"
+        logger.error("manage_user_setup_error", action=action, error=error_msg, exception_type=type(e).__name__)
         return json.dumps({
             "success": False,
-            "error": f"Unexpected error: {str(e)}"
+            "error": f"Unexpected error: {error_msg}",
+            "exception_type": type(e).__name__
         })
 
 
@@ -1306,10 +1316,12 @@ async def manage_grind_map(
             })
 
     except Exception as e:
-        logger.error("manage_grind_map_error", action=action, error=str(e))
+        error_msg = str(e) or f"{type(e).__name__} (no message)"
+        logger.error("manage_grind_map_error", action=action, error=error_msg, exception_type=type(e).__name__)
         return json.dumps({
             "success": False,
-            "error": f"Unexpected error: {str(e)}"
+            "error": f"Unexpected error: {error_msg}",
+            "exception_type": type(e).__name__
         })
 
 
@@ -1400,10 +1412,12 @@ async def manage_brewing_insights(
             })
 
     except Exception as e:
-        logger.error("manage_brewing_insights_error", action=action, error=str(e))
+        error_msg = str(e) or f"{type(e).__name__} (no message)"
+        logger.error("manage_brewing_insights_error", action=action, error=error_msg, exception_type=type(e).__name__)
         return json.dumps({
             "success": False,
-            "error": f"Unexpected error: {str(e)}"
+            "error": f"Unexpected error: {error_msg}",
+            "exception_type": type(e).__name__
         })
 
 
@@ -1486,8 +1500,10 @@ async def read_knowledge(
             "error": str(e),
         })
     except Exception as e:
-        logger.error("read_knowledge_error", action=action, filename=filename, error=str(e))
+        error_msg = str(e) or f"{type(e).__name__} (no message)"
+        logger.error("read_knowledge_error", action=action, filename=filename, error=error_msg, exception_type=type(e).__name__)
         return json.dumps({
             "success": False,
-            "error": f"Unexpected error: {str(e)}",
+            "error": f"Unexpected error: {error_msg}",
+            "exception_type": type(e).__name__
         })

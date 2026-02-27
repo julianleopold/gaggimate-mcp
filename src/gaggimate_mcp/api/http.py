@@ -5,6 +5,7 @@ Handles shot history operations via HTTP:
 - Fetch specific shot .slog files
 """
 
+import asyncio
 from typing import Optional
 import aiohttp
 
@@ -87,6 +88,13 @@ class GaggimateHTTPClient:
                     logger.info("shot_index_fetched", count=len(shot_list))
                     return shot_list
 
+        except asyncio.TimeoutError as e:
+            logger.error("http_timeout", url=url, timeout=self.timeout.total)
+            raise GaggimateError(
+                code=ErrorCode.TIMEOUT,
+                message=f"Request timed out after {self.timeout.total}s fetching shot index",
+                retryable=True,
+            ) from e
         except aiohttp.ClientError as e:
             logger.error("http_connection_error", error=str(e), url=url)
             raise GaggimateError(
@@ -142,6 +150,13 @@ class GaggimateHTTPClient:
                     logger.info("shot_fetched", shot_id=shot_id, samples=shot_data.sample_count)
                     return shot_data
 
+        except asyncio.TimeoutError as e:
+            logger.error("http_timeout", url=url, timeout=self.timeout.total)
+            raise GaggimateError(
+                code=ErrorCode.TIMEOUT,
+                message=f"Request timed out after {self.timeout.total}s fetching shot {shot_id}",
+                retryable=True,
+            ) from e
         except aiohttp.ClientError as e:
             logger.error("http_connection_error", error=str(e), url=url)
             raise GaggimateError(

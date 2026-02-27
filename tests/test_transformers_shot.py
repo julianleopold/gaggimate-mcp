@@ -654,6 +654,57 @@ class TestShotDiagnostics:
         assert diag['temperature']['annotations']['overshoot'] == 'SIGNIFICANT'
         assert diag['temperature']['annotations']['undershoot'] == 'SIGNIFICANT'
 
+    def test_stalled_shot_resistance_annotation(self):
+        """Test that a stalled shot (all flows <= 0.1) is labeled STALLED, not VERY_LOW."""
+        samples = [
+            {'t': 0, 'ct': 93.0, 'tt': 93.0, 'cp': 9.0, 'pf': 0.0},
+            {'t': 100, 'ct': 93.0, 'tt': 93.0, 'cp': 9.0, 'pf': 0.05},
+            {'t': 200, 'ct': 93.0, 'tt': 93.0, 'cp': 9.0, 'pf': 0.0},
+            {'t': 300, 'ct': 93.0, 'tt': 93.0, 'cp': 9.0, 'pf': 0.1},
+            {'t': 400, 'ct': 93.0, 'tt': 93.0, 'cp': 9.0, 'pf': 0.0},
+        ]
+        shot = self._make_shot(samples)
+        diag = compute_shot_diagnostics(shot)
+        assert diag is not None
+        # Resistance should be annotated as STALLED, not VERY_LOW
+        assert diag['resistance']['annotations']['level'] == 'STALLED'
+        assert diag['resistance']['annotations']['stalled_shot'] == 'true'
+        # Numeric values are 0.0 but the annotation clarifies the meaning
+        assert diag['resistance']['avg'] == 0.0
+
+    def test_stalled_shot_summary_annotation(self):
+        """Test that summary diagnostics also flag stalled shots."""
+        samples = [
+            {'t': 0, 'ct': 93.0, 'tt': 93.0, 'cp': 9.0, 'pf': 0.0},
+            {'t': 100, 'ct': 93.0, 'tt': 93.0, 'cp': 9.0, 'pf': 0.05},
+            {'t': 200, 'ct': 93.0, 'tt': 93.0, 'cp': 9.0, 'pf': 0.0},
+            {'t': 300, 'ct': 93.0, 'tt': 93.0, 'cp': 9.0, 'pf': 0.1},
+            {'t': 400, 'ct': 93.0, 'tt': 93.0, 'cp': 9.0, 'pf': 0.0},
+        ]
+        shot = self._make_shot(samples)
+        summary = compute_summary_diagnostics(shot)
+        assert summary is not None
+        assert summary['annotations']['resistance_level'] == 'STALLED'
+        assert summary['annotations']['stalled_shot'] == 'true'
+
+    def test_temperature_stability_uses_filtered_population(self):
+        """Test that t_std is computed on the same tt>0 population as overshoot/undershoot."""
+        # Mix of samples with and without target temp.
+        # Samples without tt (tt=0) should be excluded from stability calc.
+        samples = [
+            {'t': 0, 'ct': 80.0, 'tt': 0.0, 'cp': 9.0, 'pf': 2.0},   # no target — excluded
+            {'t': 100, 'ct': 93.0, 'tt': 93.0, 'cp': 8.5, 'pf': 2.0},  # included
+            {'t': 200, 'ct': 93.5, 'tt': 93.0, 'cp': 8.0, 'pf': 2.0},  # included
+            {'t': 300, 'ct': 93.0, 'tt': 93.0, 'cp': 7.5, 'pf': 2.1},  # included
+            {'t': 400, 'ct': 93.5, 'tt': 93.0, 'cp': 7.0, 'pf': 2.2},  # included
+        ]
+        shot = self._make_shot(samples)
+        diag = compute_shot_diagnostics(shot)
+        assert diag is not None
+        # If tt=0 sample (80°C) were included, std would be much higher
+        # With only the 93.0-93.5 range, std should be small
+        assert diag['temperature']['stability_std_c'] < 1.0
+
 
 class TestDetailLevels:
     """Tests for the 3-level detail system."""
