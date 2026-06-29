@@ -1576,7 +1576,7 @@ def compute_summary_diagnostics(shot: ShotData) -> Optional[SummaryDiagnostics]:
         ss_pressures, ss_flows, ss_samples,
     )
     if len(ss_flows) < _MIN_STEADY_STATE_SAMPLES:
-        ss_pressures, ss_flows = brew_pressures, brew_flows
+        ss_pressures, ss_flows, ss_samples = brew_pressures, brew_flows, brew_samples
     r_values = [p / (f * f) for p, f in zip(ss_pressures, ss_flows) if f > 0.1]
     r_avg = _round2(_safe_mean(r_values))
     r_slope = _round2(_linear_slope(r_values, dt))
