@@ -1128,6 +1128,7 @@ def _compute_rmse(actual: list[float], target: list[float]) -> float:
 _PREINFUSION_KEYWORDS = (
     'preinfusion', 'pre-infusion', 'pi', 'soak',
     'bloom', 'fill', 'preinfuse',
+    'saturate', 'saturation',  # Stock GaggiMate phase name — see issue #18
 )
 
 _DECLINE_KEYWORDS = (
@@ -1564,8 +1565,19 @@ def compute_summary_diagnostics(shot: ShotData) -> Optional[SummaryDiagnostics]:
     brew_temps = [s.get('ct', 0.0) for s in brew_samples]
     brew_weights = [s.get('v', 0.0) for s in brew_samples]
 
-    # Resistance
-    r_values = [p / (f * f) for p, f in zip(brew_pressures, brew_flows) if f > 0.1]
+    # Resistance — over the steady-state extraction window (same trim the
+    # channeling builder uses) so a low-flow ramp/bloom doesn't inflate the
+    # summary number; fall back to the whole brew window when the trimmed
+    # window is too short. Deliberate divergence — see issue #17.
+    ss_pressures, ss_flows, ss_samples = _trim_ramp_up(
+        brew_pressures, brew_flows, brew_samples,
+    )
+    ss_pressures, ss_flows, ss_samples, _ = _strip_flow_edges(
+        ss_pressures, ss_flows, ss_samples,
+    )
+    if len(ss_flows) < _MIN_STEADY_STATE_SAMPLES:
+        ss_pressures, ss_flows, ss_samples = brew_pressures, brew_flows, brew_samples
+    r_values = [p / (f * f) for p, f in zip(ss_pressures, ss_flows) if f > 0.1]
     r_avg = _round2(_safe_mean(r_values))
     r_slope = _round2(_linear_slope(r_values, dt))
 

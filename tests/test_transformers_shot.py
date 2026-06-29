@@ -1547,3 +1547,194 @@ class TestChannelingRegressionFixtures:
         c = d['channeling']
         assert c['channeling_risk'] == "LOW"
         assert c['flow_jitter_ml_s'] < 0.025
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Issue #18 — phase classification misses 'saturate'/'saturation'
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestSaturatePhaseClassification:
+    """Stock GaggiMate uses a pre-infusion phase literally named 'Saturate'.
+
+    The keyword 'saturate' was missing from _PREINFUSION_KEYWORDS, so the
+    phase was bucketed as brew.  Both 'saturate' and 'saturation' must now
+    classify as preinfusion.  'saturate' is NOT a substring of 'saturation'
+    (they differ at the 8th character), so both keywords must be present.
+    """
+
+    def test_saturate_exact_name_classifies_as_preinfusion(self):
+        """`_classify_phase_by_name('Saturate')` must return 'preinfusion'."""
+        assert _classify_phase_by_name('Saturate') == 'preinfusion'
+
+    def test_saturation_exact_name_classifies_as_preinfusion(self):
+        """`_classify_phase_by_name('Saturation')` must return 'preinfusion'."""
+        assert _classify_phase_by_name('Saturation') == 'preinfusion'
+
+    def test_saturate_substring_in_creative_name(self):
+        """Creative names that contain 'saturate' should also match."""
+        assert _classify_phase_by_name('Pre-Saturate') == 'preinfusion'
+        assert _classify_phase_by_name('long saturation phase') == 'preinfusion'
+
+    def test_saturate_keyword_in_preinfusion_keywords_tuple(self):
+        """Both keywords must appear in the exported tuple."""
+        assert 'saturate' in _PREINFUSION_KEYWORDS
+        assert 'saturation' in _PREINFUSION_KEYWORDS
+
+    def test_saturate_phase_excluded_from_brew_samples(self):
+        """A phase named 'Saturate' must be skipped by _get_brew_phase_samples,
+        so brew samples come only from the subsequent extraction phase."""
+        samples = [
+            # Saturate phase — should be excluded
+            {'t': 0, 'ct': 90.0, 'cp': 2.0, 'pf': 0.3, 'phase': 0},
+            {'t': 100, 'ct': 91.0, 'cp': 3.5, 'pf': 0.5, 'phase': 0},
+            {'t': 200, 'ct': 92.0, 'cp': 4.0, 'pf': 0.6, 'phase': 0},
+            # Extraction phase — should be included
+            {'t': 300, 'ct': 93.0, 'cp': 9.0, 'pf': 2.0, 'phase': 1},
+            {'t': 400, 'ct': 93.0, 'cp': 8.8, 'pf': 2.1, 'phase': 1},
+            {'t': 500, 'ct': 93.0, 'cp': 8.5, 'pf': 2.1, 'phase': 1},
+        ]
+        shot = ShotData(
+            id='001', version=5, fields_mask=0xFF, sample_count=6,
+            sample_interval=100, profile_id='test', profile_name='Test',
+            timestamp=1640000000, rating=0, duration=30000, weight=40.0,
+            samples=samples,
+            phases=[
+                PhaseTransition(sample_index=0, phase_number=0, phase_name='Saturate'),
+                PhaseTransition(sample_index=3, phase_number=1, phase_name='Extraction'),
+            ],
+        )
+        brew = _get_brew_phase_samples(shot)
+        assert len(brew) == 3, (
+            f"Expected 3 brew samples (extraction only), got {len(brew)}; "
+            "'Saturate' phase was not excluded"
+        )
+        assert brew[0]['cp'] == 9.0, "First brew sample should be from the Extraction phase"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Issue #17 — summary resistance inflated by whole-brew window
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestSummaryResistanceSteadyState:
+    """compute_summary_diagnostics must compute resistance over the
+    steady-state extraction window (after _trim_ramp_up + _strip_flow_edges)
+    rather than the naive whole-brew window.
+
+    A low-flow ramp at the start of the brew phase has very high P/flow²,
+    inflating the summary resistance_avg if not trimmed.
+    """
+
+    def _make_shot(self, samples, phases=None, **kwargs):
+        defaults = dict(
+            id='000100', version=5, fields_mask=0xFF,
+            sample_count=len(samples), sample_interval=100,
+            profile_id='test', profile_name='Test Profile',
+            timestamp=1640000000, rating=0, duration=30000,
+            weight=40.0,
+        )
+        defaults.update(kwargs)
+        return ShotData(samples=samples, phases=phases or [], **defaults)
+
+    def test_ramp_inflates_naive_resistance_but_not_steady_state(self):
+        """When the brew window opens with a pressure ramp at low flow,
+        resistance_avg must be the steady-state value, not the inflated
+        whole-window mean.
+
+        Ramp samples (cp < 90 % of peak=9.0, i.e. < 8.1):
+          cp=3.0, pf=0.5 → R = 3.0 / 0.25 = 12.0
+          cp=5.0, pf=0.5 → R = 5.0 / 0.25 = 20.0
+          cp=7.0, pf=0.5 → R = 7.0 / 0.25 = 28.0
+        Steady-state samples (cp=9.0, pf=2.0) → R = 9.0 / 4.0 = 2.25 each
+
+        Naive whole-window mean ≈ (12+20+28+2.25×8)/11 ≈ 7.09
+        Steady-state mean = 2.25 — markedly lower.
+        """
+        preinfusion = [
+            {'t': i * 100, 'ct': 91.0, 'cp': 1.0, 'pf': 0.1, 'phase': 0}
+            for i in range(3)
+        ]
+        ramp = [
+            {'t': (i + 3) * 100, 'ct': 93.0, 'cp': float(cp), 'pf': 0.5, 'phase': 1}
+            for i, cp in enumerate([3.0, 5.0, 7.0])
+        ]
+        steady = [
+            {'t': (i + 6) * 100, 'ct': 93.0, 'cp': 9.0, 'pf': 2.0, 'phase': 1}
+            for i in range(8)
+        ]
+        samples = preinfusion + ramp + steady
+        shot = self._make_shot(
+            samples,
+            phases=[
+                PhaseTransition(sample_index=0, phase_number=0, phase_name='Preinfusion'),
+                PhaseTransition(sample_index=3, phase_number=1, phase_name='Extraction'),
+            ],
+        )
+
+        diag = compute_summary_diagnostics(shot)
+        assert diag is not None
+
+        # Compute the naive whole-window resistance for reference.
+        # Brew samples are ramp (3) + steady (8) = 11 total; all pf > 0.1.
+        naive_r_values = (
+            [3.0 / 0.25, 5.0 / 0.25, 7.0 / 0.25]  # ramp
+            + [9.0 / 4.0] * 8                        # steady
+        )
+        naive_mean = sum(naive_r_values) / len(naive_r_values)  # ≈ 7.09
+
+        # Steady-state resistance (after trim) should equal 2.25.
+        assert diag['resistance_avg'] == 2.25, (
+            f"Expected steady-state resistance_avg=2.25, got {diag['resistance_avg']}"
+        )
+        # And it must be markedly lower than the naive whole-window figure.
+        assert diag['resistance_avg'] < naive_mean * 0.5, (
+            f"resistance_avg ({diag['resistance_avg']}) is not markedly lower than "
+            f"naive whole-window mean ({naive_mean:.2f})"
+        )
+
+    def test_fallback_when_trimmed_window_too_short(self):
+        """When the steady-state window has fewer than _MIN_STEADY_STATE_SAMPLES
+        samples, resistance must fall back to the whole brew window and still
+        return a finite, positive value (not None or NaN).
+
+        This shot has only 2 steady samples after trim, which is below the
+        threshold of 5, so the fallback activates.
+        """
+        from gaggimate_mcp.transformers.shot import _MIN_STEADY_STATE_SAMPLES
+
+        # Construct a brew window: 4 low-pressure ramp + 2 steady samples
+        # _trim_ramp_up keeps only samples with cp >= 90%*9 = 8.1 → just 2
+        ramp = [
+            {'t': i * 100, 'ct': 93.0, 'cp': float(cp), 'pf': 0.5, 'phase': 0}
+            for i, cp in enumerate([3.0, 5.0, 6.0, 7.0])
+        ]
+        steady = [
+            {'t': (i + 4) * 100, 'ct': 93.0, 'cp': 9.0, 'pf': 2.0, 'phase': 0}
+            for i in range(2)
+        ]
+        samples = ramp + steady
+        assert 2 < _MIN_STEADY_STATE_SAMPLES, "test premise: trimmed window is too short"
+
+        shot = self._make_shot(samples)
+
+        diag = compute_summary_diagnostics(shot)
+        assert diag is not None
+
+        # Fallback to whole-brew resistance — must be a sensible positive float.
+        assert diag['resistance_avg'] is not None
+        assert diag['resistance_avg'] > 0, (
+            f"Expected positive resistance_avg from fallback, got {diag['resistance_avg']}"
+        )
+        import math
+        assert not math.isnan(diag['resistance_avg']), "resistance_avg must not be NaN"
+
+        # Compute the brew samples as _get_brew_phase_samples would (no phases →
+        # pressure-threshold fallback: keep samples with cp >= 50% of peak=9.0).
+        brew = [s for s in samples if s['cp'] >= 0.5 * 9.0]
+        all_r = [s['cp'] / (s['pf'] ** 2) for s in brew if s['pf'] > 0.1]
+        expected = round(sum(all_r) / len(all_r), 2)
+        assert diag['resistance_avg'] == expected, (
+            f"Fallback resistance_avg ({diag['resistance_avg']}) does not match "
+            f"whole-window mean ({expected})"
+        )
