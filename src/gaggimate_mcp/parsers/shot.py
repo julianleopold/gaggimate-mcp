@@ -1,6 +1,14 @@
 """Parser for .slog binary shot files.
 
 Mirrors shot_log_format.h from the Gaggimate firmware.
+
+Fix (v6+ format): In firmware v6+, the T (tick) field was widened from
+uint16 to uint32 and now stores absolute milliseconds directly (no
+x sample_interval needed).  A new WP field (cumulative water pumped) was
+also added at bit 13.  The previous parser only scanned bits 0-12 and
+always read T as uint16 with the tick*interval transform, producing a
+progressive 2-byte/sample misalignment that corrupted every subsequent
+field.
 """
 
 import struct
@@ -10,7 +18,7 @@ from typing import Optional
 
 # Constants
 HEADER_SIZE_V4 = 128
-HEADER_SIZE_V5 = 512
+HEADER_SIZE_V5 = 512  # v5+ (including v6, v7, ...) -- header size unchanged
 MAGIC = 0x544F4853  # 'SHOT'
 
 # Scaling factors
@@ -22,7 +30,7 @@ RESISTANCE_SCALE = 100
 
 # Field bit positions (must match shot_log_format.h)
 FIELD_BITS = {
-    'T': 0,    # tick
+    'T': 0,    # tick (uint16 in v5-; uint32 ms in v6+)
     'TT': 1,   # target temp
     'CT': 2,   # current temp
     'TP': 3,   # target pressure
@@ -35,6 +43,7 @@ FIELD_BITS = {
     'EV': 10,  # estimated weight
     'PR': 11,  # puck resistance
     'SI': 12,  # system info (v2+)
+    'WP': 13,  # cumulative water pumped (v6+)
 }
 
 
@@ -42,7 +51,7 @@ FIELD_BITS = {
 class FieldDef:
     """Field definition with parsing info."""
     name: str
-    field_type: str  # 'uint8', 'uint16', 'int16'
+    field_type: str  # 'uint8', 'uint16', 'int16', 'uint32'
     scale: Optional[float] = None
     transform: Optional[callable] = None
 
@@ -51,7 +60,7 @@ class FieldDef:
 FIELD_DEFS = {
     FIELD_BITS['T']: FieldDef(
         name='t',
-        field_type='uint16',
+        field_type='uint16',  # overridden to uint32 for v6+ at parse time
         transform=lambda val, sample_interval: val * sample_interval
     ),
     FIELD_BITS['TT']: FieldDef(name='tt', field_type='uint16', scale=TEMP_SCALE),
@@ -77,6 +86,7 @@ FIELD_DEFS = {
             'extended_recording': bool(val & 0x0010),
         }
     ),
+    FIELD_BITS['WP']: FieldDef(name='wp', field_type='uint16', scale=WEIGHT_SCALE),
 }
 
 
@@ -149,7 +159,7 @@ def parse_binary_shot(data: bytes, shot_id: str) -> ShotData:
     Raises:
         ValueError: If file format is invalid
     """
-    # Check for HTML responses before size validation — the device may return
+    # Check for HTML responses before size validation -- the device may return
     # a short HTML error page that would otherwise trigger "Shot file too small"
     if is_html_response(data):
         raise ValueError(
@@ -167,7 +177,17 @@ def parse_binary_shot(data: bytes, shot_id: str) -> ShotData:
         raise ValueError(f"Invalid shot magic: 0x{magic:08x} (expected 0x{MAGIC:08x})")
 
     version = struct.unpack_from('<B', data, 4)[0]
-    header_size = HEADER_SIZE_V5 if version >= 5 else HEADER_SIZE_V4
+
+    # Byte 5: device_sample_size (added in v6+; 0 in older files).
+    # Byte 6-7: header size stored in the file itself (added in v6+; 0 in older files).
+    device_sample_size = struct.unpack_from('<B', data, 5)[0]
+    stored_header_size = struct.unpack_from('<H', data, 6)[0]
+
+    # Determine header size
+    if version >= 5:
+        header_size = stored_header_size if stored_header_size > 0 else HEADER_SIZE_V5
+    else:
+        header_size = HEADER_SIZE_V4
 
     if len(data) < header_size:
         raise ValueError(f"Shot file too small for version {version}: {len(data)} bytes")
@@ -206,28 +226,37 @@ def parse_binary_shot(data: bytes, shot_id: str) -> ShotData:
                 phase_name=phase_name
             ))
 
-    # Calculate sample data size
-    fields_per_sample = count_set_bits(fields_mask)
+    # Build field order based on mask.
+    # Range must cover all defined bits including WP at bit 13.
+    field_order = []
+    for bit in range(14):  # 0-13 inclusive (was range(13), missing WP)
+        if fields_mask & (1 << bit):
+            field_order.append(bit)
+
+    fields_per_sample = len(field_order)
     if fields_per_sample == 0:
         raise ValueError(f"Invalid shot file: fields_mask is 0 (no fields recorded)")
-    sample_data_size = fields_per_sample * 2  # Each field is 2 bytes
+
+    # v6+ change: the T field widened from uint16 (2 bytes) to uint32 (4 bytes).
+    # This means each sample is 2 bytes larger than fields_per_sample * 2.
+    # Use the device_sample_size from the header when available; fall back to
+    # calculating it from the version.
+    t_field_size = 4 if version >= 6 else 2
+    if device_sample_size > 0:
+        sample_data_size = device_sample_size
+    else:
+        sample_data_size = t_field_size + (fields_per_sample - 1) * 2
 
     # Determine actual samples (handle truncated files)
     available_data = len(data) - header_size
     actual_sample_count = min(sample_count, available_data // sample_data_size)
     incomplete = actual_sample_count < sample_count
 
-    # Build field order based on mask
-    field_order = []
-    for bit in range(13):
-        if fields_mask & (1 << bit):
-            field_order.append(bit)
-
     # Parse samples
     samples = []
     for i in range(actual_sample_count):
         sample = {}
-        sample_offset = header_size + i * sample_data_size
+        sample_start = header_size + i * sample_data_size
 
         # Add phase number based on transitions
         for phase in reversed(phases):
@@ -235,19 +264,29 @@ def parse_binary_shot(data: bytes, shot_id: str) -> ShotData:
                 sample['phase'] = phase.phase_number
                 break
 
-        # Parse each field in this sample
-        for field_index, field_bit in enumerate(field_order):
+        # Parse each field using a running byte offset within the sample.
+        # We cannot use field_index * 2 because the T field is 4 bytes in v6+.
+        field_byte_offset = sample_start
+
+        for field_bit in field_order:
             field_def = FIELD_DEFS.get(field_bit)
             if not field_def:
+                # Unknown field -- skip 2 bytes
+                field_byte_offset += 2
                 continue
 
-            field_offset = sample_offset + field_index * 2
+            # v6+: T field is uint32 (4 bytes) storing absolute ms directly.
+            if version >= 6 and field_bit == FIELD_BITS['T']:
+                value = struct.unpack_from('<I', data, field_byte_offset)[0]
+                sample['t'] = value  # already in ms, no transform needed
+                field_byte_offset += 4
+                continue
 
-            # Read value based on type
+            # All other fields remain uint16 / int16 (2 bytes)
             if field_def.field_type == 'int16':
-                value = struct.unpack_from('<h', data, field_offset)[0]
+                value = struct.unpack_from('<h', data, field_byte_offset)[0]
             else:  # uint16 or uint8
-                value = struct.unpack_from('<H', data, field_offset)[0]
+                value = struct.unpack_from('<H', data, field_byte_offset)[0]
 
             # Apply transform or scale
             if field_def.transform:
@@ -256,6 +295,8 @@ def parse_binary_shot(data: bytes, shot_id: str) -> ShotData:
                 sample[field_def.name] = value / field_def.scale
             else:
                 sample[field_def.name] = value
+
+            field_byte_offset += 2
 
         samples.append(sample)
 
