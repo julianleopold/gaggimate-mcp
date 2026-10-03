@@ -104,3 +104,25 @@ class TestGaggimateConfig:
         """Test metrics are enabled by default."""
         config = GaggimateConfig()
         assert config.enable_metrics is True
+
+
+def test_host_env_var_documented_and_legacy_names(monkeypatch):
+    """GAGGIMATE_HOST / GAGGIMATE_PROTOCOL work as documented (#12); the long names still do."""
+    monkeypatch.setenv("GAGGIMATE_HOST", "192.168.0.10")
+    monkeypatch.setenv("GAGGIMATE_PROTOCOL", "wss")
+    config = GaggimateConfig()
+    assert config.gaggimate_host == "192.168.0.10"
+    assert config.gaggimate_protocol == "wss"
+
+    monkeypatch.delenv("GAGGIMATE_HOST")
+    monkeypatch.setenv("GAGGIMATE_GAGGIMATE_HOST", "192.168.0.11")
+    assert GaggimateConfig().gaggimate_host == "192.168.0.11"
+
+
+def test_host_env_var_from_dotenv_file(tmp_path, monkeypatch):
+    """The documented name is also read from a .env file, as in the issue's reproduction."""
+    monkeypatch.delenv("GAGGIMATE_HOST", raising=False)
+    monkeypatch.delenv("GAGGIMATE_GAGGIMATE_HOST", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text("GAGGIMATE_HOST=192.168.0.12\n")
+    assert GaggimateConfig(_env_file=env_file).gaggimate_host == "192.168.0.12"

@@ -72,6 +72,9 @@ See [Example: Using ChatGPT to manually create profiles for Gaggimate by Dule Ra
 
 ## Changelog
 
+### 2026-10-03
+- **Bug fix**: `GAGGIMATE_HOST` and `GAGGIMATE_PROTOCOL` set in the environment or `.env` are now honored, as documented; previously only `GAGGIMATE_GAGGIMATE_HOST` / `GAGGIMATE_GAGGIMATE_PROTOCOL` were read, so the server silently fell back to `gaggimate.local` (#12). The long names still work.
+
 ### 2026-04-22
 - **Channeling indicators v2**: Rewrote the channeling-risk computation around four independent indicators, each catching a specific physical signature, with descriptor fields separated from scored indicators.
   - **Window trim (V4)**: After the existing pressure-ramp trim, also strips leading & trailing zero-flow samples (valve-closed at entry, volumetric-cutoff at exit). Eliminates the class of false-positive HIGH ratings caused by trapped-pressure tails.
