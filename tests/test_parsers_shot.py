@@ -227,3 +227,89 @@ class TestBinaryShotParser:
         assert shot.sample_count == 2
         assert shot.incomplete == True
         assert len(shot.samples) == 2
+
+
+def _build_v5plus_header(version, reserved0, fields_mask, sample_count, duration=40000):
+    """Build a 512-byte v5+ header with no phase transitions."""
+    header = struct.pack(
+        '<IB B H H H I I I I 32s 48s H',
+        0x544F4853, version, reserved0, 512,
+        250, 0,
+        fields_mask, sample_count, duration, 1792181285,
+        b'prof\x00'.ljust(32, b'\x00'), b'Profile\x00'.ljust(48, b'\x00'), 433,
+    )
+    return header + b'\x00' * (512 - len(header))
+
+
+def _full_sample_v7(t_ms, ct, cp, wp):
+    """One 30-byte v7/v8 sample: uint32 t followed by 13 uint16/int16 fields."""
+    return struct.pack(
+        '<I HHHH hhhh HHHHH',
+        t_ms,
+        960, int(ct * 10),            # tt, ct
+        90, int(cp * 10),             # tp, cp
+        250, 0, 180, 0,               # fl, tf, pf, vf
+        0, 215, 1234,                 # v, ev, pr
+        0x0020,                       # si (process is brew)
+        int(wp * 10),                 # wp
+    )
+
+
+class TestBinaryShotParserV6Plus:
+    """Firmware 1.9.0+ logs (v6 uint32 timestamps, v7/v8 water-pumped field)."""
+
+    def test_parse_v7_full_mask(self):
+        mask = 0x3FFF
+        samples = _full_sample_v7(250, 95.4, 1.2, 3.5) + _full_sample_v7(30217, 89.1, 9.0, 61.0)
+        data = _build_v5plus_header(7, 30, mask, 2) + samples
+
+        shot = parse_binary_shot(data, "000112")
+
+        assert shot.version == 7
+        assert shot.sample_count == 2
+        s0, s1 = shot.samples
+        assert s0['t'] == 250
+        assert s1['t'] == 30217  # real ms, not index * interval
+        assert s0['tt'] == 96.0
+        assert s0['ct'] == 95.4
+        assert s1['cp'] == 9.0
+        assert s1['pf'] == 1.8
+        assert s1['ev'] == 21.5
+        assert s1['pr'] == 12.34
+        assert s1['wp'] == 61.0
+        assert s1['systemInfo']['raw'] == 0x0020
+
+    def test_parse_v8_same_layout_as_v7(self):
+        data = _build_v5plus_header(8, 30, 0x3FFF, 1) + _full_sample_v7(1000, 93.0, 5.0, 10.0)
+        shot = parse_binary_shot(data, "000200")
+        assert shot.samples[0]['t'] == 1000
+        assert shot.samples[0]['ct'] == 93.0
+        assert shot.samples[0]['wp'] == 10.0
+
+    def test_parse_v6_uint32_timestamp(self):
+        mask = 0x1FFF  # no wp field
+        sample = _full_sample_v7(5000, 92.0, 8.5, 0)[:-2]  # drop wp -> 28 bytes
+        data = _build_v5plus_header(6, 28, mask, 1) + sample
+        shot = parse_binary_shot(data, "000150")
+        assert shot.samples[0]['t'] == 5000
+        assert shot.samples[0]['ct'] == 92.0
+        assert shot.samples[0]['cp'] == 8.5
+        assert 'wp' not in shot.samples[0]
+
+    def test_parse_legacy_hardware_scale_v6_uses_uint16_tick(self):
+        # Legacy hardware-scale v6 wrote 26-byte samples with a uint16 tick
+        mask = 0x1FFF
+        sample = struct.pack('<H HHHH hhhh HHHH', 4, 930, 925, 90, 88, 0, 0, 0, 0, 0, 0, 0, 0)
+        data = _build_v5plus_header(6, 26, mask, 1) + sample
+        shot = parse_binary_shot(data, "000151")
+        assert shot.samples[0]['t'] == 4 * 250
+        assert shot.samples[0]['ct'] == 92.5
+
+    def test_sample_size_mismatch_raises(self):
+        data = _build_v5plus_header(7, 32, 0x3FFF, 1) + _full_sample_v7(0, 90, 0, 0) + b'\x00\x00'
+        try:
+            parse_binary_shot(data, "000999")
+        except ValueError as e:
+            assert "sample size mismatch" in str(e)
+        else:
+            raise AssertionError("expected ValueError")

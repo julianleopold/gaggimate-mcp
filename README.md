@@ -72,6 +72,10 @@ See [Example: Using ChatGPT to manually create profiles for Gaggimate by Dule Ra
 
 ## Changelog
 
+### 2026-10-16
+
+- **GaggiMate 1.9.0 shot logs (format v6–v8)**: `analyze_shot` now parses the newer `.slog` layout. Since v6 the per-sample `t` field is a uint32 of real elapsed milliseconds (previously a uint16 tick), and v7 added a cumulative water-pumped field (`wp`, 30-byte samples). The old parser read every field as 2 bytes, shifting all values one slot and producing nonsense temperatures, pressures and weights. Also handles the legacy hardware-scale v6 variant, exposes `wp`, and fails loudly on unknown field bits or a sample-size mismatch instead of returning shifted data.
+
 ### 2026-04-22
 - **Channeling indicators v2**: Rewrote the channeling-risk computation around four independent indicators, each catching a specific physical signature, with descriptor fields separated from scored indicators.
   - **Window trim (V4)**: After the existing pressure-ramp trim, also strips leading & trailing zero-flow samples (valve-closed at entry, volumetric-cutoff at exit). Eliminates the class of false-positive HIGH ratings caused by trapped-pressure tails.
@@ -617,7 +621,7 @@ gaggimate-mcp/
 │   │   ├── websocket.py    # WebSocket client (profiles, shot notes)
 │   │   └── http.py         # HTTP client (shot history)
 │   ├── parsers/            # Binary file parsers
-│   │   ├── shot.py         # .slog shot file parser (V4/V5)
+│   │   ├── shot.py         # .slog shot file parser (V4–V8)
 │   │   └── index.py        # index.bin parser
 │   ├── models/             # Pydantic data models
 │   │   ├── profile.py      # Brewing profile structure

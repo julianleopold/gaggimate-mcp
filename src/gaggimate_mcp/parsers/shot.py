@@ -19,6 +19,7 @@ PRESSURE_SCALE = 10
 FLOW_SCALE = 100
 WEIGHT_SCALE = 10
 RESISTANCE_SCALE = 100
+WATER_PUMPED_SCALE = 10
 
 # Field bit positions (must match shot_log_format.h)
 FIELD_BITS = {
@@ -35,6 +36,7 @@ FIELD_BITS = {
     'EV': 10,  # estimated weight
     'PR': 11,  # puck resistance
     'SI': 12,  # system info (v2+)
+    'WP': 13,  # cumulative water pumped (v7+)
 }
 
 
@@ -77,7 +79,21 @@ FIELD_DEFS = {
             'extended_recording': bool(val & 0x0010),
         }
     ),
+    FIELD_BITS['WP']: FieldDef(name='wp', field_type='uint16', scale=WATER_PUMPED_SCALE),
 }
+
+
+def has_elapsed_timestamp(version: int, reserved0: int, fields_mask: int) -> bool:
+    """Whether samples store `t` as a uint32 of elapsed milliseconds.
+
+    v1-v5 store `t` as a uint16 sample index (multiply by sample_interval).
+    v6+ store `t` as a uint32 of real elapsed ms. One exception mirrors
+    shotLogHasElapsedTimestamp() in the firmware: a legacy hardware-scale v6
+    build wrote 26-byte samples with a uint16 `t` (reserved0 == 26, mask 0x1FFF).
+    """
+    if version < 6:
+        return False
+    return not (version == 6 and reserved0 == 26 and fields_mask == 0x1FFF)
 
 
 @dataclass
@@ -206,22 +222,39 @@ def parse_binary_shot(data: bytes, shot_id: str) -> ShotData:
                 phase_name=phase_name
             ))
 
-    # Calculate sample data size
-    fields_per_sample = count_set_bits(fields_mask)
-    if fields_per_sample == 0:
+    # Build field order and per-field byte widths based on mask
+    reserved0 = struct.unpack_from('<B', data, 5)[0]
+    elapsed_t = has_elapsed_timestamp(version, reserved0, fields_mask)
+
+    field_order = []
+    field_widths = []
+    for bit in range(32):
+        if not fields_mask & (1 << bit):
+            continue
+        if bit not in FIELD_DEFS:
+            raise ValueError(
+                f"Unsupported shot log field bit {bit} in fields_mask "
+                f"0x{fields_mask:x} (version {version})"
+            )
+        field_order.append(bit)
+        field_widths.append(4 if bit == FIELD_BITS['T'] and elapsed_t else 2)
+
+    if not field_order:
         raise ValueError(f"Invalid shot file: fields_mask is 0 (no fields recorded)")
-    sample_data_size = fields_per_sample * 2  # Each field is 2 bytes
+    sample_data_size = sum(field_widths)
+
+    # v6+ firmware records the sample size in reserved0; a mismatch means we
+    # don't understand this layout, so fail rather than return shifted values.
+    if version >= 6 and reserved0 not in (0, sample_data_size):
+        raise ValueError(
+            f"Shot log v{version} sample size mismatch: header says {reserved0} "
+            f"bytes, fields_mask 0x{fields_mask:x} implies {sample_data_size}"
+        )
 
     # Determine actual samples (handle truncated files)
     available_data = len(data) - header_size
     actual_sample_count = min(sample_count, available_data // sample_data_size)
     incomplete = actual_sample_count < sample_count
-
-    # Build field order based on mask
-    field_order = []
-    for bit in range(13):
-        if fields_mask & (1 << bit):
-            field_order.append(bit)
 
     # Parse samples
     samples = []
@@ -236,18 +269,22 @@ def parse_binary_shot(data: bytes, shot_id: str) -> ShotData:
                 break
 
         # Parse each field in this sample
-        for field_index, field_bit in enumerate(field_order):
-            field_def = FIELD_DEFS.get(field_bit)
-            if not field_def:
-                continue
+        field_offset = sample_offset
+        for field_bit, width in zip(field_order, field_widths):
+            field_def = FIELD_DEFS[field_bit]
 
-            field_offset = sample_offset + field_index * 2
+            if field_bit == FIELD_BITS['T'] and elapsed_t:
+                # v6+: uint32 elapsed milliseconds, no interval scaling
+                sample[field_def.name] = struct.unpack_from('<I', data, field_offset)[0]
+                field_offset += width
+                continue
 
             # Read value based on type
             if field_def.field_type == 'int16':
                 value = struct.unpack_from('<h', data, field_offset)[0]
             else:  # uint16 or uint8
                 value = struct.unpack_from('<H', data, field_offset)[0]
+            field_offset += width
 
             # Apply transform or scale
             if field_def.transform:
