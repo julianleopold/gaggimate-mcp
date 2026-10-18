@@ -19,6 +19,9 @@ SHOT_FLAG_DELETED = 0x02
 SHOT_FLAG_HAS_NOTES = 0x04
 
 WEIGHT_SCALE = 10
+TEMP_SCALE = 10
+PRESSURE_SCALE = 10
+FLOW_SCALE = 100
 
 
 def decode_c_string(data: bytes) -> str:
@@ -44,6 +47,12 @@ class IndexEntry:
     deleted: bool
     has_notes: bool
     incomplete: bool
+    # Per-shot aggregates (firmware v1.9.0+; carved from former reserved
+    # padding at offsets 96/98/100, so entry size is unchanged). None on
+    # entries written by older firmware, which read back as 0.
+    avg_temp: Optional[float] = None
+    max_pressure: Optional[float] = None
+    avg_flow: Optional[float] = None
 
 
 @dataclass
@@ -115,6 +124,10 @@ def parse_binary_index(data: bytes) -> IndexData:
 
         volume = volume_raw / WEIGHT_SCALE if volume_raw > 0 else None
 
+        avg_temp_raw = struct.unpack_from('<H', data, base + 96)[0]
+        max_pressure_raw = struct.unpack_from('<H', data, base + 98)[0]
+        avg_flow_raw = struct.unpack_from('<H', data, base + 100)[0]
+
         entries.append(IndexEntry(
             id=entry_id,
             timestamp=timestamp,
@@ -128,6 +141,9 @@ def parse_binary_index(data: bytes) -> IndexData:
             deleted=bool(flags & SHOT_FLAG_DELETED),
             has_notes=bool(flags & SHOT_FLAG_HAS_NOTES),
             incomplete=not bool(flags & SHOT_FLAG_COMPLETED),
+            avg_temp=avg_temp_raw / TEMP_SCALE if avg_temp_raw > 0 else None,
+            max_pressure=max_pressure_raw / PRESSURE_SCALE if max_pressure_raw > 0 else None,
+            avg_flow=avg_flow_raw / FLOW_SCALE if avg_flow_raw > 0 else None,
         ))
 
     header = IndexHeader(
@@ -165,6 +181,9 @@ def index_to_shot_list(index_data: IndexData) -> list[dict]:
             'rating': entry.rating if entry.rating > 0 else None,
             'incomplete': entry.incomplete,
             'has_notes': entry.has_notes,
+            'avg_temp': entry.avg_temp,
+            'max_pressure': entry.max_pressure,
+            'avg_flow': entry.avg_flow,
         })
 
     # Sort by timestamp, most recent first

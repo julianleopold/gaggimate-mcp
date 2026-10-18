@@ -145,6 +145,63 @@ class TestBinaryIndexParser:
         assert shot_list[1]['volume'] == 40.0
         assert shot_list[1]['rating'] == 4
 
+    def test_parse_index_entry_with_v9_aggregates(self):
+        """Firmware v1.9.0 carves avg_temp/max_pressure/avg_flow out of the
+        former reserved padding at entry offsets 96/98/100."""
+        header = struct.pack('<I H H I I', INDEX_MAGIC, 1, 128, 1, 2)
+        header = header + b'\x00' * (32 - len(header))
+
+        profile_id = b'profile\x00' + b'\x00' * 24
+        profile_name = b'Profile\x00' + b'\x00' * 40
+        entry = struct.pack('<I I I H B B', 1, 1640000000, 25000, 400, 4, SHOT_FLAG_COMPLETED)
+        entry = entry + profile_id + profile_name
+        assert len(entry) == 96
+        entry = entry + struct.pack('<HHH', 934, 89, 180)  # avg_temp, max_pressure, avg_flow
+        entry = entry + b'\x00' * (128 - len(entry))
+
+        data = header + entry
+        index = parse_binary_index(data)
+
+        assert index.entries[0].avg_temp == 93.4
+        assert index.entries[0].max_pressure == 8.9
+        assert index.entries[0].avg_flow == 1.8
+
+    def test_parse_index_entry_without_aggregates_reads_none(self):
+        """Older firmware never wrote these fields -- 0 means not recorded."""
+        header = struct.pack('<I H H I I', INDEX_MAGIC, 1, 128, 1, 2)
+        header = header + b'\x00' * (32 - len(header))
+
+        profile_id = b'profile\x00' + b'\x00' * 24
+        profile_name = b'Profile\x00' + b'\x00' * 40
+        entry = struct.pack('<I I I H B B', 1, 1640000000, 25000, 400, 4, SHOT_FLAG_COMPLETED)
+        entry = entry + profile_id + profile_name + b'\x00' * (128 - len(entry) - len(profile_id) - len(profile_name))
+
+        data = header + entry
+        index = parse_binary_index(data)
+
+        assert index.entries[0].avg_temp is None
+        assert index.entries[0].max_pressure is None
+        assert index.entries[0].avg_flow is None
+
+    def test_index_to_shot_list_surfaces_aggregates(self):
+        """list_recent_shots should get the aggregates without a full .slog fetch."""
+        header = struct.pack('<I H H I I', INDEX_MAGIC, 1, 128, 1, 2)
+        header = header + b'\x00' * (32 - len(header))
+
+        profile_id = b'profile\x00' + b'\x00' * 24
+        profile_name = b'Profile\x00' + b'\x00' * 40
+        entry = struct.pack('<I I I H B B', 1, 1640000000, 25000, 400, 4, SHOT_FLAG_COMPLETED)
+        entry = entry + profile_id + profile_name
+        entry = entry + struct.pack('<HHH', 934, 89, 180)
+        entry = entry + b'\x00' * (128 - len(entry))
+
+        data = header + entry
+        shot_list = index_to_shot_list(parse_binary_index(data))
+
+        assert shot_list[0]['avg_temp'] == 93.4
+        assert shot_list[0]['max_pressure'] == 8.9
+        assert shot_list[0]['avg_flow'] == 1.8
+
     def test_parse_index_invalid_magic(self):
         """Test parsing with invalid magic number."""
         data = struct.pack('<I', 0xDEADBEEF) + b'\x00' * 28
