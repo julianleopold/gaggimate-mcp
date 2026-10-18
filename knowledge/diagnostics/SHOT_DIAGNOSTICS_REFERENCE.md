@@ -15,10 +15,31 @@ The `analyze_shot` tool accepts a `detail` parameter:
 | **summary** (default) | Quick triage, first assessment | Lowest | Key indicators, phase list (no samples) |
 | **per_phase** | Identify which phase has the issue | Medium | Full diagnostics + per-phase breakdowns (no samples) |
 | **per_phase_detailed** | See curve shape in problem phases | Higher | Everything in per_phase + ~5 evenly-spaced averaged samples per phase |
+| **time_series** | See the whole curve in one pass instead of phase-by-phase | Higher | Everything in per_phase + a dense binned-mean series (`resolution_hz` param, clamped 1-4 Hz, capped at 150 points) instead of per-phase samples |
 
 **Start with `summary`.** Escalate to `per_phase` to identify *which phase* has
 the problem. Use `per_phase_detailed` when you need to see the pressure/flow
-curve shape.
+curve shape in a specific phase, or `time_series` when you need the whole
+shot's curve in one pass (pass `resolution_hz` to `analyze_shot`, e.g. `2`).
+
+---
+
+## Shot Summary (`summary` key — always present, every detail level)
+
+Unlike the `diagnostics` block below, this is basic descriptive statistics —
+no bands, no scoring — and is present regardless of `detail`.
+
+| Field | Unit | Meaning |
+|-------|------|---------|
+| `temperature.{min,max,avg}_c` / `target_avg_c` | °C | Current vs. target temperature across the whole shot |
+| `pressure.{min,max,avg}_bar` / `target_avg_bar` | bar | Current vs. target pressure; `target_avg_bar` only counts samples with `tp > 0` |
+| `pressure.peak_time_s` | s | When peak pressure occurred |
+| `flow.{avg,peak}_flow_ml_s` | ml/s | Puck flow (`pf`) statistics |
+| `flow.total_volume_ml` | ml | Puck flow (`pf`) integrated over time — an *estimate*, not a direct measurement |
+| `flow.time_to_first_drip_s` | s | Time to first non-zero `pf` sample |
+| `flow.water_pumped_ml` | ml | **Firmware v7+ only.** Cumulative water pumped (`wp`), a direct machine measurement — more trustworthy than `total_volume_ml`'s flow-integration estimate. `null` on older firmware. |
+| `extraction.{preinfusion,main_extraction,total}_time_s` | s | Phase timing derived from the 50%-of-peak-pressure threshold |
+| `extraction.brew_ratio_actual` | ratio | **Firmware v7+ only.** `water_pumped_ml ÷ final_weight_g` — water in vs. weight out. More direct than inferring ratio from `total_volume_ml`. `null` when `water_pumped_ml` is unavailable or the shot has no recorded final weight. |
 
 ---
 
@@ -28,7 +49,7 @@ Returned as a flat object with key indicators:
 
 | Field | Type | What it tells you |
 |-------|------|-------------------|
-| `resistance_avg` | float | Average puck resistance (P/F²). Higher = finer grind or tighter puck. |
+| `resistance_avg` | float | Average puck resistance (P/F²), **steady-state-trimmed** (see blind spot below). Higher = finer grind or tighter puck. |
 | `resistance_slope` | float | How resistance changes over the shot. Negative = erosion (normal). Steep negative = possible channeling. |
 | `channeling_risk` | string | Overall channeling risk: LOW / MODERATE / HIGH / VERY_HIGH / INSUFFICIENT_DATA |
 | `temperature_stability_c` | float | Std deviation of brew temp. Lower = more stable. |
@@ -58,9 +79,31 @@ Returned as a flat object with key indicators:
 | `flow_adherence` | EXCELLENT (<0.3) · GOOD (<0.8) · FAIR (<1.5) · POOR *(when target flow available)* |
 | `flow_overshoot` | WITHIN_TOLERANCE (<0.3) · MINOR_DEVIATION (<0.7) · NOTABLE_DEVIATION (<1.5) · SEVERE_DEVIATION *(when target flow available)* |
 
+### CRITICAL BLIND SPOT — `summary.resistance_avg` vs. `per_phase` top-level `diagnostics.resistance.avg`
+
+These two numbers are computed over **different windows** and will disagree on
+a bloom/profiled shot:
+
+- `summary.resistance_avg` (above) is **steady-state-trimmed** — it excludes
+  the pressure ramp-up and any leading/trailing near-zero-flow samples, so it
+  reflects the actual extraction regime.
+- The **`per_phase`/above top-level** `diagnostics.resistance.avg` (see Resistance
+  section below) is **NOT trimmed** — it averages the whole brew window. Because
+  resistance is P/flow², a profiled shot's low-flow ramp-up inflates this value
+  **upward** (low flow → very large P/flow²), so it can read HIGH when the true
+  steady-state extraction resistance is MODERATE or LOW.
+
+**Correct interpretation:** trust `summary.resistance_avg` (trimmed) over the
+per_phase top-level. At `per_phase`, read the **Extraction** phase's own
+`phases[].diagnostics.resistance_avg` instead of the top-level
+`diagnostics.resistance.avg` — the Extraction phase is an isolated steady
+window and is accurate on its own. If the per_phase top-level reads HIGH on a
+bloom/profiled shot but the summary and the Extraction phase do not, the
+top-level is the one that's misleading.
+
 ---
 
-## Full Diagnostics (per_phase / per_phase_detailed)
+## Full Diagnostics (per_phase / per_phase_detailed / time_series)
 
 Returned as an object with these sub-sections:
 
@@ -71,7 +114,7 @@ Captures grind fineness, puck prep quality, channeling, and erosion.
 
 | Field | Unit | Meaning |
 |-------|------|---------|
-| `avg` | dimensionless | Average resistance across brew phase |
+| `avg` | dimensionless | Average resistance across the **whole brew window, untrimmed** — see the blind spot above; prefer `summary.resistance_avg` or the Extraction phase's own `resistance_avg` |
 | `std` | dimensionless | Variability of resistance |
 | `slope` | /s | Change rate — negative = erosion, steep negative = channeling |
 | `peak` | dimensionless | Maximum resistance recorded |
@@ -237,6 +280,74 @@ excessive dose, or a puck preparation issue. Recommend coarsening grind.
 
 ---
 
+## `machine_reported` Block (always present, `null` when the firmware sent nothing)
+
+Firmware-reported `pr`/`fl`/`ev` values, surfaced as an independent trend
+cross-check instead of being parsed and discarded.
+
+| Field | Unit | Meaning |
+|-------|------|---------|
+| `puck_resistance_avg` | firmware's own scale | The machine's own puck resistance estimate. **Different model and units from the computed `resistance_avg`** — compare direction/trend only, never the absolute number. |
+| `pump_flow_avg_ml_s` | ml/s | Pump output flow — not puck flow (`pf`). |
+| `est_final_weight_g` | g | The machine's volumetric weight estimate — useful mainly when no Bluetooth scale was connected. Always computed over the full shot, never windowed. |
+
+**Window:** at `summary`, `puck_resistance_avg`/`pump_flow_avg_ml_s` are
+averaged over the same steady-state-trimmed window as `summary.resistance_avg`,
+so the two numbers are directly comparable as a trend cross-check. At every
+other detail level they use the full (untrimmed) brew window, matching the
+per_phase top-level `diagnostics.resistance.avg`.
+
+**How to use:** if the computed and firmware resistance both trend the same
+direction (both rising, both HIGH) over the same window, that agreement makes
+the signal more credible. If they diverge, surface the conflict rather than
+silently picking one.
+
+---
+
+## Exit Reasons & Brew Delay (firmware v7+ only, omitted on older files)
+
+Each phase's `exit_reason` and the shot-level `final_exit_reason` name *why*
+that phase/shot ended — previously this had to be inferred from the data.
+
+| Value | Meaning |
+|-------|---------|
+| Volumetric target | Hit the phase's configured weight/volume target |
+| Pressure target | Hit the phase's configured pressure target |
+| Flow target | Hit the phase's configured flow target |
+| Pumped target | Hit the phase's configured water-pumped target |
+| Duration | Phase's configured time elapsed |
+| Safety timeout | Brew safety timeout triggered |
+| Aborted | Shot was manually stopped before finishing |
+| Hold released | A held phase (hold-to-flush) ended on button release |
+| Ratio target | Hit the phase's configured brew-ratio target |
+
+A phase that reads "Duration" exited on a timer, not because it achieved its
+target — useful context when a profile's intended target (e.g. a volumetric
+cutoff) wasn't actually reached before time ran out.
+
+`brew_delay_ms` (shot-level) is the predictive volumetric lead time the shot
+ran with — context for why a volumetric shot's final weight might slightly
+over/undershoot its target (the machine cuts off *before* the target is
+hit, anticipating the last few seconds of drip).
+
+---
+
+## Water Pumped & Brew Ratio (firmware v7+ only)
+
+`wp` (cumulative water pumped) is a direct machine measurement of water
+pushed through the group head — more trustworthy than inferring volume by
+integrating `pf` (puck flow) over time, which is what `flow.total_volume_ml`
+does. See `summary.flow.water_pumped_ml` and `summary.extraction.brew_ratio_actual`
+above for the shot-level figures.
+
+At `per_phase` and above, a preinfusion phase's diagnostics include
+`bloom_absorption_ml` — water pumped during that phase specifically (the `wp`
+delta from phase start to end) — alongside `ramp_rate_bar_s` and
+`saturation_time_s`. This is the actual amount of water the bloom/saturation
+step absorbed, not an estimate.
+
+---
+
 ## Per-Phase Diagnostics
 
 At `per_phase` and `per_phase_detailed` levels, each phase in the `phases` list includes a
@@ -249,9 +360,14 @@ Phase names from the firmware are classified automatically:
 
 | Phase Type | Matched Names |
 |------------|---------------|
-| **preinfusion** | preinfusion, pre-infusion, pi, soak, bloom, fill, preinfuse |
+| **preinfusion** | preinfusion, pre-infusion, pi, soak, bloom, fill, preinfuse, saturate, saturation |
 | **decline** | decline, taper, ramp-down, ramp down, cool down, cooldown |
 | **brew** | Everything else (extraction, brew, main, hold, flat, step N, etc.) |
+
+Stock GaggiMate profiles ship a phase literally named "Saturate" — it is
+classified as preinfusion and excluded from the brew window (and therefore
+from the resistance/channeling calculations) like any other preinfusion
+phase.
 
 ### Common Fields (all phase types)
 
@@ -263,6 +379,7 @@ Phase names from the firmware are classified automatically:
 | `pressure_rmse_bar` | RMSE vs target pressure for this phase |
 | `flow_rmse_ml_s` | RMSE vs target flow for this phase |
 | `annotations.pressure_adherence` | EXCELLENT / GOOD / FAIR / POOR |
+| `exit_reason` | *(firmware v7+ only)* Why this phase ended — see Exit Reasons above |
 
 ### Preinfusion-Specific Fields
 
@@ -270,6 +387,7 @@ Phase names from the firmware are classified automatically:
 |-------|------|---------|
 | `ramp_rate_bar_s` | bar/s | How fast pressure ramps up |
 | `saturation_time_s` | s | Time until flow stabilises (puck saturation) |
+| `bloom_absorption_ml` | ml | *(firmware v7+ only)* Water pumped during this phase (`wp` delta) |
 
 **Annotations:** `ramp_rate` → GENTLE (<0.5) · MODERATE (<1.5) · BRISK (<3.0) · AGGRESSIVE (<5.0) · VERY_AGGRESSIVE
 
@@ -348,4 +466,7 @@ Per-phase shows brew phase channeling?
 
 Need to see pressure/flow trend in a specific phase?
   → analyze_shot(shot_id, detail="per_phase_detailed")  # ~5 averaged samples per phase
+
+Need to see the whole shot's curve shape in one pass (not phase-by-phase)?
+  → analyze_shot(shot_id, detail="time_series", resolution_hz=2)
 ```

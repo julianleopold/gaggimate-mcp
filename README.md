@@ -72,6 +72,21 @@ See [Example: Using ChatGPT to manually create profiles for Gaggimate by Dule Ra
 
 ## Changelog
 
+### 2026-10-18
+- **Fixed: `.slog` parser silently corrupted shots recorded by firmware v1.9.0+**. GaggiMate firmware v1.9.0 bumped the shot log format from v5 to v7 (first sample field widened from a 2-byte tick to a 4-byte elapsed-millisecond counter; a `wp` field added), growing each sample record from 26 to 30 bytes. The parser hardcoded the old 26-byte stride and never read the file's own declared record size, so every v6+ shot decoded misaligned — producing temperatures in the thousands of °C, matching bogus pressures, scale readings over a kilogram, negative flow, and phase timestamps in the thousands of seconds, all with no warning. The parser now trusts the on-disk record/header size, supports shot log versions 1–8, and degrades gracefully (decodes known fields, skips unknown ones, emits a `warnings` entry in `analyze_shot` output) on any future version instead of failing silently.
+- **New telemetry surfaced from firmware v1.9.0+ (v7/v8 shot logs)**:
+  - `summary.flow.water_pumped_ml` and `summary.extraction.brew_ratio_actual` — cumulative water pumped (`wp`), a direct machine measurement, enabling a true water-in/weight-out brew ratio instead of inferring volume from integrated flow.
+  - Per-phase `exit_reason` and shot-level `final_exit_reason` — why a phase/shot ended (hit its target vs. timed out vs. aborted), previously unrecoverable from telemetry.
+  - `brew_delay_ms` — the predictive volumetric lead time a shot ran with.
+  - Preinfusion `bloom_absorption_ml` — water pumped during the bloom/pre-infusion phase specifically.
+  - `list_recent_shots` entries now include `avg_temp`, `max_pressure`, `avg_flow` when the firmware recorded them, avoiding a full `.slog` fetch for cross-shot comparison.
+- **Ported analytics improvements from brio-ai-barista** (a sibling project; its shot-analysis engine was itself originally a port of this repo's transformer, since diverged):
+  - **Steady-state-trimmed summary resistance**: `summary.resistance_avg`/`resistance_slope` now exclude the pressure ramp-up and near-zero-flow edges (the same trim channeling detection already used), so a bloom/profiled shot's ramp no longer inflates the summary reading (e.g. a shot that read HIGH on the whole brew window now correctly reads LOW on the steady extraction). The `per_phase`-level top-level `diagnostics.resistance.avg` remains untrimmed by design — see the new blind-spot note in `SHOT_DIAGNOSTICS_REFERENCE.md`.
+  - **`saturate`/`saturation` recognised as preinfusion** phase names, alongside `bloom`/`soak`/`fill` — stock GaggiMate profiles ship a phase literally named "Saturate".
+  - **New `machine_reported` block** in `analyze_shot` output: surfaces firmware-reported puck resistance/pump flow/estimated weight (previously parsed and discarded) as an independent trend cross-check, window-aligned with the computed resistance at `summary` level.
+  - **New `time_series` detail level**: a dense binned-mean series across the whole shot (clamp 1–4 Hz, capped at 150 points) via `analyze_shot(shot_id, detail="time_series", resolution_hz=2)`, for seeing the whole curve shape in one pass instead of phase-by-phase.
+- `SHOT_DIAGNOSTICS_REFERENCE.md` updated with all of the above; `diagnose` and `gaggimate-profiles` skills updated and version-bumped.
+
 ### 2026-04-22
 - **Channeling indicators v2**: Rewrote the channeling-risk computation around four independent indicators, each catching a specific physical signature, with descriptor fields separated from scored indicators.
   - **Window trim (V4)**: After the existing pressure-ramp trim, also strips leading & trailing zero-flow samples (valve-closed at entry, volumetric-cutoff at exit). Eliminates the class of false-positive HIGH ratings caused by trapped-pressure tails.

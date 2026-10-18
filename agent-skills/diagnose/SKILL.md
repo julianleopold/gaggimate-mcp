@@ -1,7 +1,7 @@
 ---
 name: diagnose
 metadata:
-  version: 36ef44f (2026-04-22)
+  version: 0af88ad (2026-10-18)
 description: >
   Diagnose espresso extraction issues by correlating machine telemetry with taste feedback.
   Use when user says: "what went wrong", "analyze that shot", "why did it taste [sour/bitter/flat]",
@@ -34,6 +34,7 @@ curve shape data, escalate progressively:
 ```
 Use: analyze_shot(shot_id, detail="per_phase")            # per-phase diagnostics (no samples)
 Use: analyze_shot(shot_id, detail="per_phase_detailed")   # per-phase diagnostics + ~5 averaged samples per phase
+Use: analyze_shot(shot_id, detail="time_series", resolution_hz=2)  # whole-shot curve in one pass instead of phase-by-phase
 ```
 See the complete metric reference, annotation bands, and interpretation cheat sheet:
 ```

@@ -519,7 +519,7 @@ async def manage_profile(
 
 
 @mcp.tool()
-async def analyze_shot(shot_id: str, detail: str = "summary") -> str:
+async def analyze_shot(shot_id: str, detail: str = "summary", resolution_hz: int = 2) -> str:
     """Get comprehensive shot analysis.
 
     Args:
@@ -534,6 +534,13 @@ async def analyze_shot(shot_id: str, detail: str = "summary") -> str:
             - "per_phase_detailed": Everything in per_phase plus ~5
               averaged samples per phase showing the curve shape.
               Use after per_phase to see pressure/flow trends.
+            - "time_series": Everything in per_phase plus a dense
+              binned-mean series across the whole shot (see
+              resolution_hz) instead of per-phase samples. Use when
+              you need to see the whole curve shape in one pass.
+        resolution_hz: Requested points/sec for "time_series" (clamped
+            to 1-4 internally, capped at 150 points total). Ignored at
+            other detail levels.
 
     Returns:
         JSON string with shot analysis
@@ -553,7 +560,7 @@ async def analyze_shot(shot_id: str, detail: str = "summary") -> str:
 
         # Transform for AI analysis
         detail_level = detail if detail in VALID_DETAIL_LEVELS else "summary"
-        transformed = transform_shot_for_ai(shot_data, detail=detail_level)
+        transformed = transform_shot_for_ai(shot_data, detail=detail_level, resolution_hz=resolution_hz)
 
         # Get rating if available (using normalized ID)
         rating_data = rating_storage.get_rating(normalized_id)

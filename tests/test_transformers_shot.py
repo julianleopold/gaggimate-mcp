@@ -36,6 +36,8 @@ from gaggimate_mcp.transformers.shot import (
     _TAPER_SMOOTHNESS_BANDS,
     _PREINFUSION_KEYWORDS,
     _DECLINE_KEYWORDS,
+    _build_time_series,
+    _has_active_scale,
 )
 
 
@@ -107,6 +109,315 @@ class TestShotTransformer:
         assert summary['extraction']['preinfusion_time_s'] == 0.2
         assert summary['extraction']['main_extraction_time_s'] == 24.8
         assert summary['extraction']['total_time_s'] == 25.0
+
+    def test_summary_resistance_is_b_trimmed_not_whole_brew_window(self):
+        """Ported from brio-ai-barista divergence #1 (commit cdd82a9).
+
+        A bloom/profiled shot's Saturate phase has low flow, which inflates
+        P/F^2 when resistance is averaged over the whole brew window. The
+        summary should instead use the same steady-state trim (ramp-up +
+        flow-edge stripping) that channeling detection already applies, so
+        it reflects the extraction puck, not the ramp.
+
+        Reference values verified against the original (pre-port) Python
+        analyzer on identical data, documented in the brio-ai-barista
+        commit that first ported this divergence:
+          - whole-brew untrimmed, Saturate included: r_avg 3.57 -> HIGH
+          - Saturate excluded but untrimmed (keyword only, already in):
+            r_avg 1.82 -> MODERATE
+          - Saturate excluded + steady-state trim (this divergence):
+            r_avg 1.44 -> LOW
+        """
+        samples = []
+        t = 0
+
+        def add(n, cp, pf, tp, v=0.0):
+            nonlocal t
+            for _ in range(n):
+                s = {'t': t, 'cp': cp, 'pf': pf, 'tp': tp, 'ct': 93.0, 'tt': 93.0}
+                if v:
+                    s['v'] = v
+                samples.append(s)
+                t += 100
+
+        add(10, 2.0, 0.05, 3.0)   # Pre-infusion: flow < 0.1, excluded from resistance anyway
+        add(25, 6.0, 0.9, 6.0)    # Saturate: low flow, P/F^2 ~ 7.4 -> inflates untrimmed
+        add(8, 8.0, 1.5, 9.0)     # Ramp: P/F^2 ~ 3.56, < 90% peak pressure -> trimmed by B-trim
+        add(45, 9.0, 2.5, 9.0, 20.0)  # Extraction: steady, P/F^2 = 1.44 -> the honest LOW
+
+        shot = ShotData(
+            id='000330', version=5, fields_mask=0, sample_count=len(samples),
+            sample_interval=100, profile_id='p', profile_name='Bloom Test',
+            timestamp=0, rating=0, duration=len(samples) * 100, weight=20.0,
+            samples=samples,
+            phases=[
+                PhaseTransition(sample_index=0, phase_number=0, phase_name='Pre-infusion'),
+                PhaseTransition(sample_index=10, phase_number=1, phase_name='Saturate'),
+                PhaseTransition(sample_index=35, phase_number=2, phase_name='Ramp'),
+                PhaseTransition(sample_index=43, phase_number=3, phase_name='Extraction'),
+            ],
+        )
+
+        diag = compute_summary_diagnostics(shot)
+
+        assert diag['resistance_avg'] == 1.44
+        assert diag['annotations']['resistance_level'] == 'LOW'
+
+    @staticmethod
+    def _make_machine_reported_shot():
+        """Bloom-shaped shot (Pre-infusion/Saturate/Ramp/Extraction) carrying
+        firmware pr/fl/ev fields, distinguishable per phase so window
+        alignment (full brew vs. B-trimmed) is observable."""
+        samples = []
+        t = 0
+
+        def add(n, cp, pf, tp, pr, fl, v=0.0, ev=0.0):
+            nonlocal t
+            for _ in range(n):
+                s = {'t': t, 'cp': cp, 'pf': pf, 'tp': tp, 'ct': 93.0, 'tt': 93.0, 'pr': pr, 'fl': fl}
+                if v:
+                    s['v'] = v
+                if ev:
+                    s['ev'] = ev
+                samples.append(s)
+                t += 100
+
+        add(10, 2.0, 0.05, 3.0, pr=0.5, fl=0.1)              # Pre-infusion
+        add(25, 6.0, 0.9, 6.0, pr=7.0, fl=0.9)                # Saturate
+        add(8, 8.0, 1.5, 9.0, pr=3.5, fl=1.5)                 # Ramp
+        add(45, 9.0, 2.5, 9.0, pr=1.5, fl=2.5, v=20.0, ev=27.5)  # Extraction
+
+        return ShotData(
+            id='000330', version=5, fields_mask=0, sample_count=len(samples),
+            sample_interval=100, profile_id='p', profile_name='Bloom Test',
+            timestamp=0, rating=0, duration=len(samples) * 100, weight=20.0,
+            samples=samples,
+            phases=[
+                PhaseTransition(sample_index=0, phase_number=0, phase_name='Pre-infusion'),
+                PhaseTransition(sample_index=10, phase_number=1, phase_name='Saturate'),
+                PhaseTransition(sample_index=35, phase_number=2, phase_name='Ramp'),
+                PhaseTransition(sample_index=43, phase_number=3, phase_name='Extraction'),
+            ],
+        )
+
+    def test_machine_reported_none_when_no_firmware_fields(self):
+        """No pr/fl/ev anywhere in the shot -> machine_reported is None."""
+        shot = ShotData(
+            id='1', version=5, fields_mask=0xFF, sample_count=2, sample_interval=100,
+            profile_id='test', profile_name='Test', timestamp=0, rating=0,
+            duration=200, weight=20.0,
+            samples=[{'t': 0, 'cp': 2.0, 'pf': 0.5}, {'t': 100, 'cp': 3.0, 'pf': 1.0}],
+            phases=[],
+        )
+
+        transformed = transform_shot_for_ai(shot)
+
+        assert transformed['machine_reported'] is None
+
+    def test_machine_reported_full_brew_window_at_per_phase_level(self):
+        """per_phase keeps the full (untrimmed) brew window -- Saturate
+        excluded by phase classification, Ramp+Extraction both included."""
+        shot = self._make_machine_reported_shot()
+
+        transformed = transform_shot_for_ai(shot, detail="per_phase")
+        mr = transformed['machine_reported']
+
+        # weighted mean over Ramp(n=8, pr=3.5, fl=1.5) + Extraction(n=45, pr=1.5, fl=2.5)
+        assert mr['puck_resistance_avg'] == 1.8   # (8*3.5 + 45*1.5) / 53
+        assert mr['pump_flow_avg_ml_s'] == 2.35   # (8*1.5 + 45*2.5) / 53
+        assert mr['est_final_weight_g'] == 27.5   # last non-zero ev, full shot
+        assert mr['units']['puck_resistance_avg'] == "firmware index (machine's own scale)"
+        assert "do NOT compare it as an absolute" in mr['note']
+
+    def test_machine_reported_b_trimmed_window_at_summary_level(self):
+        """summary aligns pr/fl to the SAME B-trimmed steady-state window
+        that compute_summary_diagnostics uses for resistance_avg -- so the
+        cross-check between machine and computed resistance is meaningful."""
+        shot = self._make_machine_reported_shot()
+
+        transformed = transform_shot_for_ai(shot, detail="summary")
+        mr = transformed['machine_reported']
+
+        # Trimmed window = Extraction only (same trim as the resistance divergence test).
+        assert mr['puck_resistance_avg'] == 1.5
+        assert mr['pump_flow_avg_ml_s'] == 2.5
+        assert mr['est_final_weight_g'] == 27.5  # est_weight is never windowed
+
+    def test_phase_exit_reason_surfaced_when_recorded(self):
+        """Phase exit reasons (v7+) distinguish a phase that hit its
+        volumetric target from one that merely timed out -- previously
+        had to be inferred.
+
+        Firmware semantics: PhaseTransition.transition_reason records why
+        the *previous* phase ended (see shot_log_format.h). So phase i's
+        exit reason comes from phases[i+1].transition_reason, and the
+        last phase's exit reason comes from shot.final_exit_reason.
+        """
+        shot = ShotData(
+            id='1', version=7, fields_mask=0x3FFF, sample_count=4,
+            sample_interval=100, profile_id='test', profile_name='Test',
+            timestamp=0, rating=0, duration=400, weight=28.1,
+            samples=[
+                {'t': 0, 'ct': 90.0, 'cp': 2.0, 'pf': 0.5},
+                {'t': 100, 'ct': 91.0, 'cp': 3.0, 'pf': 0.6},
+                {'t': 200, 'ct': 93.0, 'cp': 9.0, 'pf': 2.5},
+                {'t': 300, 'ct': 93.0, 'cp': 8.5, 'pf': 2.0},
+            ],
+            phases=[
+                # First transition's own reason is moot (nothing preceded
+                # it) -- real firmware always writes 0/Unknown here.
+                PhaseTransition(sample_index=0, phase_number=0, phase_name='Pre-infusion'),
+                # Why Pre-infusion (phase 0) ended.
+                PhaseTransition(sample_index=2, phase_number=1, phase_name='Extraction',
+                                 transition_reason=1, transition_reason_label='Volumetric target'),
+            ],
+            # Why Extraction (the last phase) ended.
+            final_exit_reason=5, final_exit_reason_label='Duration',
+        )
+
+        transformed = transform_shot_for_ai(shot, detail="per_phase")
+
+        assert transformed['phases'][0]['exit_reason'] == 'Volumetric target'
+        assert transformed['phases'][1]['exit_reason'] == 'Duration'
+
+    def test_phase_exit_reason_omitted_on_legacy_files(self):
+        """v1-v6 files have no exit reason recorded (transition_reason=0,
+        the default); don't clutter the payload with 'Unknown'."""
+        shot = ShotData(
+            id='1', version=5, fields_mask=0xFF, sample_count=2, sample_interval=100,
+            profile_id='test', profile_name='Test', timestamp=0, rating=0,
+            duration=200, weight=28.1,
+            samples=[{'t': 0, 'ct': 90.0, 'cp': 2.0, 'pf': 0.5},
+                     {'t': 100, 'ct': 91.0, 'cp': 3.0, 'pf': 0.6}],
+            phases=[PhaseTransition(sample_index=0, phase_number=0, phase_name='Extraction')],
+        )
+
+        transformed = transform_shot_for_ai(shot, detail="per_phase")
+
+        assert 'exit_reason' not in transformed['phases'][0]
+
+    def test_final_exit_reason_and_brew_delay_surfaced(self):
+        shot = ShotData(
+            id='1', version=7, fields_mask=0x3FFF, sample_count=2, sample_interval=100,
+            profile_id='test', profile_name='Test', timestamp=0, rating=0,
+            duration=200, weight=28.1,
+            samples=[{'t': 0, 'ct': 90.0, 'cp': 2.0, 'pf': 0.5},
+                     {'t': 100, 'ct': 91.0, 'cp': 3.0, 'pf': 0.6}],
+            phases=[],
+            final_exit_reason=1, final_exit_reason_label='Volumetric target',
+            brew_delay_ms=500,
+        )
+
+        transformed = transform_shot_for_ai(shot)
+
+        assert transformed['final_exit_reason'] == 'Volumetric target'
+        assert transformed['brew_delay_ms'] == 500
+
+    def test_final_exit_reason_omitted_on_legacy_files(self):
+        shot = ShotData(
+            id='1', version=5, fields_mask=0xFF, sample_count=2, sample_interval=100,
+            profile_id='test', profile_name='Test', timestamp=0, rating=0,
+            duration=200, weight=28.1,
+            samples=[{'t': 0, 'ct': 90.0, 'cp': 2.0, 'pf': 0.5},
+                     {'t': 100, 'ct': 91.0, 'cp': 3.0, 'pf': 0.6}],
+            phases=[],
+        )
+
+        transformed = transform_shot_for_ai(shot)
+
+        assert 'final_exit_reason' not in transformed
+        assert 'brew_delay_ms' not in transformed
+
+    def test_transform_shot_for_ai_surfaces_parser_warnings(self):
+        """A decode problem (e.g. an unsupported future shot log version)
+        must be visible in the AI-facing payload, not silently swallowed."""
+        shot = ShotData(
+            id='000493', version=9, fields_mask=0xFF, sample_count=2,
+            sample_interval=100, profile_id='test', profile_name='Test',
+            timestamp=1640000000, rating=0, duration=200, weight=20.0,
+            samples=[{'t': 0, 'ct': 90.0, 'cp': 2.0, 'pf': 0.5},
+                     {'t': 100, 'ct': 91.0, 'cp': 3.0, 'pf': 1.0}],
+            phases=[],
+            warnings=["Shot log version 9 is newer than the supported maximum (8)"],
+        )
+
+        transformed = transform_shot_for_ai(shot)
+
+        assert transformed['warnings'] == [
+            "Shot log version 9 is newer than the supported maximum (8)"
+        ]
+
+    def test_transform_shot_for_ai_omits_warnings_when_none(self):
+        """No warnings -> no key, to keep the common-case payload lean."""
+        shot = ShotData(
+            id='000493', version=5, fields_mask=0xFF, sample_count=2,
+            sample_interval=100, profile_id='test', profile_name='Test',
+            timestamp=1640000000, rating=0, duration=200, weight=20.0,
+            samples=[{'t': 0, 'ct': 90.0, 'cp': 2.0, 'pf': 0.5},
+                     {'t': 100, 'ct': 91.0, 'cp': 3.0, 'pf': 1.0}],
+            phases=[],
+        )
+
+        transformed = transform_shot_for_ai(shot)
+
+        assert 'warnings' not in transformed
+
+    def test_calculate_summary_water_pumped_and_brew_ratio(self):
+        """wp (cumulative water pumped, v7+) enables a true brew ratio
+        (water in -> weight out) instead of inferring volume from pf."""
+        shot = ShotData(
+            id='1', version=7, fields_mask=0x3FFF, sample_count=3,
+            sample_interval=100, profile_id='test', profile_name='Test Profile',
+            timestamp=0, rating=0, duration=300, weight=28.1,
+            samples=[
+                {'t': 0, 'ct': 90.0, 'cp': 2.0, 'pf': 1.0, 'wp': 0.0},
+                {'t': 100, 'ct': 92.0, 'cp': 8.0, 'pf': 2.0, 'wp': 20.0},
+                {'t': 200, 'ct': 93.0, 'cp': 9.0, 'pf': 2.5, 'wp': 42.1},
+            ],
+            phases=[],
+        )
+
+        summary = calculate_summary(shot)
+
+        assert summary['flow']['water_pumped_ml'] == 42.1  # last sample's cumulative wp
+        assert summary['extraction']['brew_ratio_actual'] == 1.5  # 42.1 / 28.1
+
+    def test_calculate_summary_water_pumped_none_when_absent(self):
+        """Older firmware (v1-v6) has no wp field."""
+        shot = ShotData(
+            id='1', version=5, fields_mask=0xFF, sample_count=2, sample_interval=100,
+            profile_id='test', profile_name='Test Profile', timestamp=0, rating=0,
+            duration=200, weight=28.1,
+            samples=[{'t': 0, 'ct': 90.0, 'cp': 2.0, 'pf': 1.0},
+                     {'t': 100, 'ct': 92.0, 'cp': 8.0, 'pf': 2.0}],
+            phases=[],
+        )
+
+        summary = calculate_summary(shot)
+
+        assert summary['flow']['water_pumped_ml'] is None
+        assert summary['extraction']['brew_ratio_actual'] is None
+
+    def test_preinfusion_phase_diagnostics_bloom_absorption(self):
+        """bloom_absorption_ml (water pumped during pre-infusion, v7+) sits
+        alongside saturation_time_s in the preinfusion diagnostics block."""
+        samples = [
+            {'t': 0, 'cp': 2.0, 'pf': 0.5, 'wp': 0.0},
+            {'t': 100, 'cp': 3.0, 'pf': 0.6, 'wp': 2.5},
+            {'t': 200, 'cp': 4.0, 'pf': 0.6, 'wp': 5.0},
+        ]
+        diag = _compute_phase_diagnostics(samples, 'preinfusion', dt=0.1)
+
+        assert diag['bloom_absorption_ml'] == 5.0
+
+    def test_preinfusion_phase_diagnostics_bloom_absorption_none_when_absent(self):
+        samples = [
+            {'t': 0, 'cp': 2.0, 'pf': 0.5},
+            {'t': 100, 'cp': 3.0, 'pf': 0.6},
+        ]
+        diag = _compute_phase_diagnostics(samples, 'preinfusion', dt=0.1)
+
+        assert diag.get('bloom_absorption_ml') is None
 
     def test_process_phases_with_transitions(self):
         """Test phase processing with defined transitions."""
@@ -683,6 +994,106 @@ class TestShotDiagnostics:
         assert diag['temperature']['annotations']['undershoot'] == 'SIGNIFICANT'
 
 
+class TestHasActiveScale:
+    """Tests for _has_active_scale, which prefers the firmware's own
+    si.active_scale_connected bit (v6/v7/v8) over the v>0 heuristic.
+    """
+
+    def test_prefers_si_bit_true_even_when_weight_is_zero(self):
+        """A scale that just connected may not have accumulated weight
+        yet -- the SI bit is more reliable than 'any weight recorded'."""
+        samples = [
+            {'v': 0.0, 'systemInfo': {'active_scale_connected': True}},
+            {'v': 0.0, 'systemInfo': {'active_scale_connected': True}},
+        ]
+        assert _has_active_scale(samples, [0.0, 0.0]) is True
+
+    def test_prefers_si_bit_false_even_when_a_heuristic_would_say_true(self):
+        samples = [
+            {'v': 0.0, 'systemInfo': {'active_scale_connected': False}},
+            {'v': 0.0, 'systemInfo': {'active_scale_connected': False}},
+        ]
+        assert _has_active_scale(samples, [0.0, 0.0]) is False
+
+    def test_falls_back_to_weight_heuristic_when_si_bit_absent(self):
+        """Older firmware (v1-v5) has no systemInfo.active_scale_connected."""
+        samples = [{'v': 0.0}, {'v': 28.1}]
+        assert _has_active_scale(samples, [0.0, 28.1]) is True
+        assert _has_active_scale([{'v': 0.0}], [0.0]) is False
+
+
+class TestTimeSeries:
+    """Tests for the time_series detail level (ported from brio-ai-barista).
+
+    A 4th detail level the Python analyzer previously lacked: a dense
+    binned-mean series instead of per-phase representative samples.
+    """
+
+    @staticmethod
+    def _long_shot(n: int = 300) -> ShotData:
+        samples = [
+            {'t': i * 100, 'ct': 93.0, 'cp': 9.0, 'pf': 2.0, 'v': i * 0.1, 'phase': 0}
+            for i in range(n)
+        ]
+        return ShotData(
+            id='1', version=5, fields_mask=0xFF, sample_count=n, sample_interval=100,
+            profile_id='test', profile_name='Test', timestamp=0, rating=0,
+            duration=n * 100, weight=20.0, samples=samples, phases=[],
+        )
+
+    def test_never_exceeds_150_points(self):
+        ts = _build_time_series(self._long_shot(), 4)
+        assert len(ts['points']) <= 150
+
+    def test_clamps_requested_resolution_but_echoes_the_request(self):
+        ts = _build_time_series(self._long_shot(), 99)
+        assert ts['resolution_hz_requested'] == 99
+        assert ts['resolution_hz'] <= 4
+
+    def test_each_point_carries_required_fields(self):
+        ts = _build_time_series(self._long_shot(), 2)
+        for p in ts['points']:
+            for key in ('time_seconds', 'temperature_c', 'pressure_bar',
+                        'flow_ml_s', 'weight_g', 'phase_number'):
+                assert key in p
+
+    def test_emits_machine_puck_resistance_when_pr_present(self):
+        samples = [
+            {'t': i * 100, 'cp': 9.0, 'pf': 2.0, 'v': 0.0, 'phase': 0, 'pr': 4.5}
+            for i in range(20)
+        ]
+        shot = ShotData(
+            id='1', version=7, fields_mask=0xFF, sample_count=20, sample_interval=100,
+            profile_id='test', profile_name='Test', timestamp=0, rating=0,
+            duration=2000, weight=20.0, samples=samples, phases=[],
+        )
+        ts = _build_time_series(shot, 2)
+        assert any('machine_puck_resistance' in p for p in ts['points'])
+
+    def test_omits_machine_fields_when_absent(self):
+        ts = _build_time_series(self._long_shot(), 2)
+        assert all('machine_puck_resistance' not in p for p in ts['points'])
+
+    def test_transform_shot_for_ai_time_series_level(self):
+        shot = self._long_shot()
+        transformed = transform_shot_for_ai(shot, detail="time_series", resolution_hz=2)
+
+        assert transformed['detail_level'] == 'time_series'
+        assert 'time_series' in transformed
+        ts = transformed['time_series']
+        assert ts['point_count'] == len(ts['points'])
+        assert 0 < len(ts['points']) <= 150
+        # per-phase diagnostics yes, per-phase samples no (series replaces them)
+        for p in transformed['phases']:
+            assert 'diagnostics' in p
+            assert 'samples' not in p
+
+    def test_transform_shot_for_ai_omits_time_series_at_other_levels(self):
+        shot = self._long_shot()
+        transformed = transform_shot_for_ai(shot, detail="summary")
+        assert 'time_series' not in transformed
+
+
 class TestDetailLevels:
     """Tests for the 3-level detail system."""
 
@@ -716,7 +1127,7 @@ class TestDetailLevels:
         return self._make_shot(samples, phases=phases)
 
     def test_valid_detail_levels(self):
-        assert VALID_DETAIL_LEVELS == ("summary", "per_phase", "per_phase_detailed")
+        assert VALID_DETAIL_LEVELS == ("summary", "per_phase", "per_phase_detailed", "time_series")
 
     def test_invalid_detail_falls_back_to_summary(self):
         shot = self._standard_shot()
@@ -793,6 +1204,15 @@ class TestPhaseClassification:
     def test_preinfusion_substring_names(self):
         """Creative names containing preinfusion keywords should match."""
         for name in ['Gentle Pre-infusion', 'Blooming Phase', 'Long Soak', 'Quick Fill']:
+            assert _classify_phase(name) == 'preinfusion', f"Failed for: {name}"
+
+    def test_saturate_is_preinfusion(self):
+        """Stock GaggiMate profiles ship a phase literally named 'Saturate'.
+
+        Without this keyword it falls into the brew window and inflates
+        summary resistance (ported from brio-ai-barista divergence #2).
+        """
+        for name in ['Saturate', 'saturation', 'Gentle Saturation']:
             assert _classify_phase(name) == 'preinfusion', f"Failed for: {name}"
 
     def test_decline_exact_names(self):

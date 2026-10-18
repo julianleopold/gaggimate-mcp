@@ -32,6 +32,7 @@ class FlowSummary(TypedDict):
     avg_flow_ml_s: float
     peak_flow_ml_s: float
     time_to_first_drip_s: Optional[float]
+    water_pumped_ml: Optional[float]  # wp, cumulative (v7+); None on older firmware
 
 
 class ExtractionSummary(TypedDict):
@@ -39,6 +40,10 @@ class ExtractionSummary(TypedDict):
     preinfusion_time_s: float
     main_extraction_time_s: float
     total_time_s: float
+    # Water in (wp) / weight out -- a more direct brew ratio than inferring
+    # volume from integrated pf. None when wp isn't recorded (pre-v7) or
+    # the final weight is unknown.
+    brew_ratio_actual: Optional[float]
 
 
 class ShotSummary(TypedDict):
@@ -77,6 +82,7 @@ class PhaseDiagnostics(TypedDict, total=False):
     # Preinfusion
     ramp_rate_bar_s: float
     saturation_time_s: float
+    bloom_absorption_ml: float  # water pumped during this phase (wp delta, v7+ only)
     # Brew — channeling fields match top-level ChannelingIndicators naming
     resistance_avg: float
     resistance_slope: float
@@ -101,6 +107,10 @@ class PhaseData(TypedDict):
     total_flow_ml: float
     samples: NotRequired[list[TransformedSample]]
     diagnostics: NotRequired[PhaseDiagnostics]
+    # Why the *previous* phase ended (v7+ only; omitted on legacy files
+    # where it's always "Unknown"). Distinguishes a phase that hit its
+    # volumetric target from one that merely timed out.
+    exit_reason: NotRequired[str]
 
 
 class ResistanceDiagnostics(TypedDict):
@@ -273,6 +283,51 @@ class SummaryDiagnostics(TypedDict):
     annotations: dict[str, str]
 
 
+class MachineReportedUnits(TypedDict):
+    """Units for each MachineReported field, keyed by field name."""
+    puck_resistance_avg: str
+    pump_flow_avg_ml_s: str
+    est_final_weight_g: str
+
+
+class MachineReported(TypedDict):
+    """Firmware-reported pr/fl/ev, surfaced as a trend cross-check.
+
+    Ported from brio-ai-barista. These are parsed and scaled by the .slog
+    parser already, then discarded by the rest of the transformer in
+    favour of recomputing resistance from pressure/flow. This block
+    surfaces the machine's own numbers instead of dropping them — useful
+    as a *direction/trend* cross-check, never as an absolute comparison
+    (see ``note``): the firmware's puck resistance index uses a different
+    model and scale than ``diagnostics.resistance.avg``.
+    """
+    puck_resistance_avg: Optional[float]
+    pump_flow_avg_ml_s: Optional[float]
+    est_final_weight_g: Optional[float]
+    units: MachineReportedUnits
+    note: str
+
+
+class TimeSeriesPoint(TypedDict):
+    """One binned-mean point of a time_series detail-level output."""
+    time_seconds: float
+    temperature_c: float
+    pressure_bar: float
+    flow_ml_s: float
+    weight_g: float
+    phase_number: int
+    machine_puck_resistance: NotRequired[float]
+    machine_pump_flow_ml_s: NotRequired[float]
+
+
+class TimeSeries(TypedDict):
+    """Dense binned series (ported from brio-ai-barista)."""
+    resolution_hz: float  # effective points/sec achieved
+    resolution_hz_requested: int
+    point_count: int
+    points: list[TimeSeriesPoint]
+
+
 class TransformedShot(TypedDict):
     """Transformed shot data for AI analysis."""
     shot_id: str
@@ -284,7 +339,15 @@ class TransformedShot(TypedDict):
     summary: ShotSummary
     phases: list[PhaseData]
     diagnostics: Optional[ShotDiagnostics | SummaryDiagnostics]
+    machine_reported: Optional[MachineReported]
     detail_level: NotRequired[str]
+    time_series: NotRequired[TimeSeries]
+    # Why the shot ended (v7+ only; omitted on legacy files where it's
+    # always 0/"Unknown"), and the predictive volumetric lead time it
+    # ran with -- useful context when yield undershoots the target.
+    final_exit_reason: NotRequired[str]
+    brew_delay_ms: NotRequired[int]
+    warnings: NotRequired[list[str]]
 
 
 def calculate_total_volume(samples: list[dict], interval_ms: int) -> float:
@@ -357,11 +420,16 @@ def calculate_summary(shot: ShotData) -> ShotSummary:
             time_to_first_drip = round(times[i] * 10) / 10 if i < len(times) else None
             break
 
+    # Cumulative water pumped (wp, v7+). It's a running total, so the
+    # shot-level figure is just the last recorded value.
+    water_pumped = next((s['wp'] for s in reversed(samples) if 'wp' in s), None)
+
     flow_summary = FlowSummary(
         total_volume_ml=total_volume,
         avg_flow_ml_s=avg_flow,
         peak_flow_ml_s=peak_flow,
         time_to_first_drip_s=time_to_first_drip,
+        water_pumped_ml=water_pumped,
     )
 
     # Extraction timing
@@ -377,10 +445,17 @@ def calculate_summary(shot: ShotData) -> ShotSummary:
     total_time = shot.duration / 1000.0  # Convert to seconds
     main_extraction_time = max(0.0, total_time - preinfusion_time)
 
+    brew_ratio_actual = (
+        _round2(water_pumped / shot.weight)
+        if water_pumped is not None and shot.weight
+        else None
+    )
+
     extraction_summary = ExtractionSummary(
         preinfusion_time_s=round(preinfusion_time * 10) / 10,
         main_extraction_time_s=round(main_extraction_time * 10) / 10,
         total_time_s=round(total_time * 10) / 10,
+        brew_ratio_actual=brew_ratio_actual,
     )
 
     return ShotSummary(
@@ -892,6 +967,28 @@ def _round2(value: float) -> float:
     return round(value * 100) / 100
 
 
+def _has_active_scale(samples: list[dict], weights: list[float]) -> bool:
+    """Determine whether a scale was connected, preferring the firmware's
+    own ``si.active_scale_connected`` bit over a weight-presence guess.
+
+    Firmware v6+ (and the legacy hardware-scale fork) report this bit
+    directly, mirrored onto every sample's ``systemInfo`` dict by the
+    parser (see ``active_scale_connected`` handling in parsers/shot.py).
+    A scale that just connected may not have accumulated any weight yet,
+    so the bit is more reliable than "any weight recorded" whenever it's
+    available. Older firmware (v1-v5) has no such bit; fall back to the
+    weight heuristic there.
+    """
+    si_flags = [
+        s['systemInfo']['active_scale_connected']
+        for s in samples
+        if 'systemInfo' in s and 'active_scale_connected' in s['systemInfo']
+    ]
+    if si_flags:
+        return any(si_flags)
+    return any(w > 0 for w in weights)
+
+
 def _window_confidence(n: int) -> str:
     """Map steady-state sample count to a confidence label for channeling assessment.
 
@@ -1128,6 +1225,10 @@ def _compute_rmse(actual: list[float], target: list[float]) -> float:
 _PREINFUSION_KEYWORDS = (
     'preinfusion', 'pre-infusion', 'pi', 'soak',
     'bloom', 'fill', 'preinfuse',
+    # 'saturate'/'saturation' ported from brio-ai-barista divergence #2:
+    # stock GaggiMate profiles ship a phase literally named "Saturate",
+    # which otherwise falls into the brew window and inflates resistance.
+    'saturate', 'saturation',
 )
 
 _DECLINE_KEYWORDS = (
@@ -1234,7 +1335,7 @@ def compute_shot_diagnostics(shot: ShotData) -> Optional[ShotDiagnostics]:
 
     # Weight data (may not be available if no Bluetooth scale)
     brew_weights = [s.get('v', 0.0) for s in brew_samples]
-    has_scale = any(w > 0 for w in brew_weights)
+    has_scale = _has_active_scale(brew_samples, brew_weights)
 
     # ── PUCK RESISTANCE (the master diagnostic) ──────────────
     # R = P / F² (quadratic Darcy model)
@@ -1493,6 +1594,13 @@ def _compute_phase_diagnostics(
         annotations["ramp_rate"] = _annotate_ascending(
             abs(ramp_rate), _RAMP_RATE_BANDS
         )
+        # Water pumped during this phase (wp is a cumulative shot-level
+        # counter, v7+ only) -- how much liquid the bloom/pre-infusion
+        # actually absorbed before the main extraction began.
+        if 'wp' in phase_samples[0] and 'wp' in phase_samples[-1]:
+            result["bloom_absorption_ml"] = _round2(
+                phase_samples[-1]['wp'] - phase_samples[0]['wp']
+            )
 
     elif phase_type == "brew":
         r_values = [
@@ -1564,8 +1672,22 @@ def compute_summary_diagnostics(shot: ShotData) -> Optional[SummaryDiagnostics]:
     brew_temps = [s.get('ct', 0.0) for s in brew_samples]
     brew_weights = [s.get('v', 0.0) for s in brew_samples]
 
-    # Resistance
-    r_values = [p / (f * f) for p, f in zip(brew_pressures, brew_flows) if f > 0.1]
+    # Resistance — DIVERGENCE from a plain whole-brew-window average: on a
+    # bloom/profiled shot the low-flow ramp-up inflates P/F^2 if included
+    # (e.g. a "Saturate" phase with cp=6.0/pf=0.9 reads r~7.4, dwarfing a
+    # steady extraction's r~1.44). Trim to the steady-state window first —
+    # the same trimRampUp + stripFlowEdges pair channeling detection uses —
+    # so the summary reflects the extraction puck, not the ramp. Falls back
+    # to the untrimmed brew window when the trim leaves too few samples to
+    # be meaningful. Ported from brio-ai-barista (divergence #1).
+    r_trim_p, r_trim_f, r_trim_s = _trim_ramp_up(brew_pressures, brew_flows, brew_samples)
+    r_trim_p, r_trim_f, r_trim_s, _ = _strip_flow_edges(r_trim_p, r_trim_f, r_trim_s)
+    if len(r_trim_p) >= _MIN_STEADY_STATE_SAMPLES:
+        r_pressures, r_flows = r_trim_p, r_trim_f
+    else:
+        r_pressures, r_flows = brew_pressures, brew_flows
+
+    r_values = [p / (f * f) for p, f in zip(r_pressures, r_flows) if f > 0.1]
     r_avg = _round2(_safe_mean(r_values))
     r_slope = _round2(_linear_slope(r_values, dt))
 
@@ -1600,7 +1722,7 @@ def compute_summary_diagnostics(shot: ShotData) -> Optional[SummaryDiagnostics]:
         max_flow_overshoot = _round2(max(0.0, max(f_devs)))
 
     # Scale
-    has_scale = any(w > 0 for w in brew_weights)
+    has_scale = _has_active_scale(brew_samples, brew_weights)
 
     annotations: dict[str, str] = {
         "resistance_level": _annotate_ascending(r_avg, _RESISTANCE_LEVEL_BANDS),
@@ -1636,14 +1758,128 @@ def compute_summary_diagnostics(shot: ShotData) -> Optional[SummaryDiagnostics]:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# MACHINE-REPORTED BLOCK (ported from brio-ai-barista)
+# ═══════════════════════════════════════════════════════════════════
+
+_MACHINE_REPORTED_NOTE = (
+    "Firmware-reported values. puck_resistance_avg is the machine's own estimate on its "
+    "own scale — do NOT compare it as an absolute to the computed diagnostics.resistance.avg "
+    "(different model + units); compare direction/trend only. pump_flow_avg_ml_s is pump "
+    "output, not puck flow. est_final_weight_g is the machine's volumetric estimate, useful "
+    "mainly when no Bluetooth scale was connected."
+)
+
+
+def _build_machine_reported(shot: ShotData, detail: str) -> Optional[MachineReported]:
+    """Surface firmware pr/fl/ev instead of discarding them after parsing.
+
+    At ``summary`` level, pr/fl are averaged over the same B-trimmed
+    steady-state window ``compute_summary_diagnostics`` uses for
+    ``resistance_avg``, so the two numbers are scoped to the same window
+    and a direction/trend cross-check between them is meaningful. Every
+    other level uses the full (untrimmed) brew window, matching
+    ``compute_shot_diagnostics``' whole-brew resistance.
+    """
+    brew_samples = _get_brew_phase_samples(shot)
+
+    if detail == "summary":
+        brew_pressures = [s.get('cp', 0.0) for s in brew_samples]
+        brew_flows = [s.get('pf', 0.0) for s in brew_samples]
+        trim_p, trim_f, trim_s = _trim_ramp_up(brew_pressures, brew_flows, brew_samples)
+        trim_p, trim_f, trim_s, _ = _strip_flow_edges(trim_p, trim_f, trim_s)
+        window = trim_s if len(trim_s) >= _MIN_STEADY_STATE_SAMPLES else brew_samples
+    else:
+        window = brew_samples
+
+    pr_values = [s['pr'] for s in window if 'pr' in s]
+    # pump_flow sourced from `fl` (pump output) only -- `vf` (volumetric
+    # flow) is a different physical quantity and must not be conflated here.
+    fl_values = [s['fl'] for s in window if 'fl' in s]
+    # est_weight uses the last non-zero `ev` across the full shot (never windowed).
+    ev_values = [s['ev'] for s in shot.samples if s.get('ev', 0.0) > 0]
+
+    if not pr_values and not fl_values and not ev_values:
+        return None
+
+    return MachineReported(
+        puck_resistance_avg=_round2(_safe_mean(pr_values)) if pr_values else None,
+        pump_flow_avg_ml_s=_round2(_safe_mean(fl_values)) if fl_values else None,
+        est_final_weight_g=round(ev_values[-1] * 10) / 10 if ev_values else None,
+        units=MachineReportedUnits(
+            puck_resistance_avg="firmware index (machine's own scale)",
+            pump_flow_avg_ml_s="ml/s",
+            est_final_weight_g="g",
+        ),
+        note=_MACHINE_REPORTED_NOTE,
+    )
+
+
+def _build_time_series(shot: ShotData, resolution_hz: int = 2) -> TimeSeries:
+    """Build a dense binned-mean series (ported from brio-ai-barista).
+
+    An alternative to ``_select_samples``' ~5-points-per-phase output for
+    callers that want to see the whole curve shape in one pass. Clamped
+    to 1-4 Hz effective resolution and hard-capped at 150 points so the
+    token cost stays bounded regardless of shot length.
+    """
+    samples = shot.samples
+    dt_s = shot.sample_interval / 1000.0
+    total_samples = len(samples)
+    total_time_s = total_samples * dt_s
+
+    clamped_hz = max(1, min(4, resolution_hz))
+    raw_bins = round(clamped_hz * total_time_s)
+    bin_count = max(1, min(raw_bins, 150))
+    bin_width = total_samples / bin_count if bin_count else 0
+
+    points: list[TimeSeriesPoint] = []
+    for b in range(bin_count):
+        start_idx = int(b * bin_width)
+        end_idx = min(int((b + 1) * bin_width), total_samples)
+        if start_idx >= end_idx:
+            continue
+        window = samples[start_idx:end_idx]
+        center_idx = min((start_idx + end_idx) // 2, total_samples - 1)
+        center = samples[center_idx]
+
+        def _mean_of(key: str) -> float:
+            vals = [s[key] for s in window if key in s]
+            return _safe_mean(vals) if vals else 0.0
+
+        point = TimeSeriesPoint(
+            time_seconds=round(center.get('t', 0.0) / 1000.0 * 10) / 10,
+            temperature_c=round(_mean_of('ct') * 10) / 10,
+            pressure_bar=round(_mean_of('cp') * 10) / 10,
+            flow_ml_s=round(_mean_of('pf') * 10) / 10,
+            weight_g=round(_mean_of('v') * 10) / 10,
+            phase_number=center.get('phase', 0),
+        )
+        pr_values = [s['pr'] for s in window if 'pr' in s]
+        if pr_values:
+            point['machine_puck_resistance'] = _round2(_safe_mean(pr_values))
+        fl_values = [s['fl'] for s in window if 'fl' in s]
+        if fl_values:
+            point['machine_pump_flow_ml_s'] = _round2(_safe_mean(fl_values))
+
+        points.append(point)
+
+    return TimeSeries(
+        resolution_hz=_round2(len(points) / total_time_s) if total_time_s > 0 else 0.0,
+        resolution_hz_requested=resolution_hz,
+        point_count=len(points),
+        points=points,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
 # DETAIL LEVELS
 # ═══════════════════════════════════════════════════════════════════
 
-VALID_DETAIL_LEVELS = ("summary", "per_phase", "per_phase_detailed")
+VALID_DETAIL_LEVELS = ("summary", "per_phase", "per_phase_detailed", "time_series")
 
 
 def transform_shot_for_ai(
-    shot: ShotData, detail: str = "summary",
+    shot: ShotData, detail: str = "summary", resolution_hz: int = 2,
 ) -> TransformedShot:
     """Transform shot data for AI analysis.
 
@@ -1660,10 +1896,17 @@ def transform_shot_for_ai(
     - **per_phase_detailed**: Everything in per_phase *plus* ~5
       evenly-spaced averaged samples per phase to reveal curve shape.
       Use after per_phase to see what the pressure/flow curve looks like.
+    - **time_series**: Everything in per_phase *plus* a dense binned-mean
+      series across the whole shot (clamped 1-4 Hz, capped at 150
+      points) instead of per-phase samples. Use when you need to see the
+      whole curve shape in one pass rather than phase-by-phase.
 
     Args:
         shot: Parsed shot data
-        detail: Granularity level ("summary", "per_phase", "per_phase_detailed")
+        detail: Granularity level ("summary", "per_phase",
+            "per_phase_detailed", "time_series")
+        resolution_hz: Requested points/sec for the "time_series" level
+            (clamped to 1-4 Hz internally). Ignored at other levels.
 
     Returns:
         Transformed shot data with diagnostics appropriate to detail level
@@ -1680,11 +1923,15 @@ def transform_shot_for_ai(
     elif detail == "per_phase":
         phases = _build_phases(shot, include_samples=False, include_diagnostics=True, dt=dt)
         diagnostics = compute_shot_diagnostics(shot)
+    elif detail == "time_series":
+        # Dense series is the sample representation; per-phase samples would be redundant.
+        phases = _build_phases(shot, include_samples=False, include_diagnostics=True, dt=dt)
+        diagnostics = compute_shot_diagnostics(shot)
     else:  # per_phase_detailed
         phases = _build_phases(shot, include_samples=True, include_diagnostics=True, dt=dt)
         diagnostics = compute_shot_diagnostics(shot)
 
-    return TransformedShot(
+    result = TransformedShot(
         shot_id=shot.id,
         profile_name=shot.profile_name,
         profile_id=shot.profile_id,
@@ -1694,8 +1941,24 @@ def transform_shot_for_ai(
         summary=summary_stats,
         phases=phases,
         diagnostics=diagnostics,
+        machine_reported=_build_machine_reported(shot, detail),
         detail_level=detail,
     )
+    if detail == "time_series":
+        result['time_series'] = _build_time_series(shot, resolution_hz)
+    # final_exit_reason/brew_delay_ms are only recorded by firmware v7+;
+    # a nonzero exit reason is the signal that this file actually has
+    # them (legacy files always read 0/"Unknown").
+    if shot.final_exit_reason != 0:
+        result['final_exit_reason'] = shot.final_exit_reason_label
+        result['brew_delay_ms'] = shot.brew_delay_ms
+    # Surface parser-level decode problems (e.g. an unsupported future shot
+    # log version, or a sample-size mismatch) instead of silently returning
+    # a payload that *looks* complete. Omitted entirely in the common case
+    # to keep the payload lean.
+    if shot.warnings:
+        result['warnings'] = shot.warnings
+    return result
 
 
 def _build_phases(
@@ -1747,6 +2010,20 @@ def _build_phases(
                 "avg_pressure_bar": avg_pressure,
                 "total_flow_ml": total_flow,
             }
+
+            # PhaseTransition.transition_reason records why the PREVIOUS
+            # phase ended (v7+; see shot_log_format.h), so phase i's own
+            # exit reason lives on the *next* transition record, and the
+            # last phase's exit reason is the shot-level final_exit_reason.
+            # Omitted on legacy files, where it's always 0/"Unknown".
+            if i + 1 < len(shot.phases):
+                exit_reason_code = shot.phases[i + 1].transition_reason
+                exit_reason_label = shot.phases[i + 1].transition_reason_label
+            else:
+                exit_reason_code = shot.final_exit_reason
+                exit_reason_label = shot.final_exit_reason_label
+            if exit_reason_code != 0:
+                pd["exit_reason"] = exit_reason_label
 
             if include_samples:
                 pd["samples"] = _select_samples(phase_samples)

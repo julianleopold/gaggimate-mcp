@@ -1,7 +1,7 @@
 ---
 name: gaggimate-profiles
 metadata:
-  version: 53269c1 (2026-02-23)
+  version: 0af88ad (2026-10-18)
 description: Create custom espresso extraction profiles for Gaggimate-equipped machines (Gaggia Classic Pro, Gaggia Classic Evo, Rancilio Silvia). Use when designing pressure profiles, flow profiles, blooming profiles, lever simulation profiles, or helping with espresso extraction settings and troubleshooting. Also use when the user mentions Gaggimate, espresso profiles, pressure profiling, or extraction parameters.
 ---
 
@@ -84,7 +84,7 @@ Always output complete, valid JSON with ALL required fields:
 }
 ```
 **Phase naming for shot analysis:** The `analyze_shot` tool classifies phases by substring-matching the `name` field. Use names containing recognised keywords so specific diagnostic metrics are computed per phase:
-- **Preinfusion phases**: include `preinfusion`, `pre-infusion`, `soak`, `bloom`, or `fill` (e.g. "Pre-infusion", "Bloom", "Long Soak")
+- **Preinfusion phases**: include `preinfusion`, `pre-infusion`, `soak`, `bloom`, `fill`, or `saturate`/`saturation` (e.g. "Pre-infusion", "Bloom", "Long Soak", "Saturate")
 - **Decline/taper phases**: include `decline`, `taper`, or `cooldown` (e.g. "Decline", "Gentle Taper")
 - **Brew phases**: any other name works (e.g. "Ramp", "Hold", "Extraction")
 
