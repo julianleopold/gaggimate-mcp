@@ -379,8 +379,34 @@ class TestShotTransformer:
 
         summary = calculate_summary(shot)
 
-        assert summary['flow']['water_pumped_ml'] == 42.1  # last sample's cumulative wp
+        assert summary['flow']['water_pumped_ml'] == 42.1
         assert summary['extraction']['brew_ratio_actual'] == 1.5  # 42.1 / 28.1
+
+    def test_calculate_summary_water_pumped_survives_tail_reset(self):
+        """Real firmware v7 shots (confirmed on-device) reset wp to a small
+        residual value for the last several samples once the pump
+        deactivates -- e.g. 63.1 -> 0.2 for the last 5+ samples of a real
+        shot. Taking the *last* sample's wp (as if it were simply the
+        final cumulative total) silently returns garbage; take the max
+        across the shot instead, since wp is monotonic up to that point.
+        """
+        shot = ShotData(
+            id='1', version=7, fields_mask=0x3FFF, sample_count=5,
+            sample_interval=250, profile_id='test', profile_name='Test',
+            timestamp=0, rating=0, duration=1250, weight=28.1,
+            samples=[
+                {'t': 0, 'ct': 90.0, 'cp': 2.0, 'pf': 1.0, 'wp': 0.0},
+                {'t': 250, 'ct': 92.0, 'cp': 8.0, 'pf': 2.0, 'wp': 40.0},
+                {'t': 500, 'ct': 93.0, 'cp': 9.0, 'pf': 2.5, 'wp': 63.1},
+                {'t': 750, 'ct': 93.0, 'cp': 3.0, 'pf': 0.0, 'wp': 0.2},
+                {'t': 1000, 'ct': 93.0, 'cp': 3.0, 'pf': 0.0, 'wp': 0.2},
+            ],
+            phases=[],
+        )
+
+        summary = calculate_summary(shot)
+
+        assert summary['flow']['water_pumped_ml'] == 63.1
 
     def test_calculate_summary_water_pumped_none_when_absent(self):
         """Older firmware (v1-v6) has no wp field."""

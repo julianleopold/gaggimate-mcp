@@ -420,9 +420,13 @@ def calculate_summary(shot: ShotData) -> ShotSummary:
             time_to_first_drip = round(times[i] * 10) / 10 if i < len(times) else None
             break
 
-    # Cumulative water pumped (wp, v7+). It's a running total, so the
-    # shot-level figure is just the last recorded value.
-    water_pumped = next((s['wp'] for s in reversed(samples) if 'wp' in s), None)
+    # Cumulative water pumped (wp, v7+). Confirmed on real device shots:
+    # the firmware resets this counter to a small residual value for the
+    # last several samples once the pump deactivates (e.g. 63.1 -> 0.2),
+    # so the *last* sample is not reliable. wp is monotonic up to that
+    # point, so take the max across the shot instead.
+    wp_values = [s['wp'] for s in samples if 'wp' in s]
+    water_pumped = max(wp_values) if wp_values else None
 
     flow_summary = FlowSummary(
         total_volume_ml=total_volume,
